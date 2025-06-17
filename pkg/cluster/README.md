@@ -10,3 +10,5 @@
 `store` 分布式存储，应用日志
 
 `icluster,cluster` 对上述分布式逻辑的统一封装后对外提供
+
+`kubernetes` kubernetes k8s集群的分布式逻辑
