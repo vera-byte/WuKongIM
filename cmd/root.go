@@ -19,12 +19,13 @@ import (
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/options"
-	"github.com/WuKongIM/WuKongIM/internal/server"
+	"github.com/WuKongIM/WuKongIM/internal/server"                      // 注册 Kubernetes 集群支持
+	wk_kubernetes "github.com/WuKongIM/WuKongIM/pkg/cluster/kubernetes" // 注册 Kubernetes 集群支持
+
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
-
 	"go.uber.org/zap"
 )
 
@@ -296,8 +297,22 @@ func addCommand(cmd CMD) {
 	rootCmd.AddCommand(cmd.CMD())
 }
 
+type MyListener struct{}
+
+func (l *MyListener) OnNodeUpdate(podName, address string) {
+	fmt.Printf("节点上线或变更: %s -> %s\n", podName, address)
+	if wk_kubernetes.GlobalK8sClient == nil {
+		fmt.Println("服务发现未初始化")
+		return
+	}
+}
+
+func (l *MyListener) OnNodeDelete(podName string) {
+	fmt.Printf("节点下线: %s", podName)
+}
 func Execute() {
 	ctx := &WuKongIMContext{}
+	wk_kubernetes.StartWukongimServiceDiscovery("test", "app=wukongim", 11110, &MyListener{})
 	addCommand(newStopCMD(ctx))
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)

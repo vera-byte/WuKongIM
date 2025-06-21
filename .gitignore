@@ -45,3 +45,6 @@ wukongim*_data/
 external_ip.txt
 
 wukongim.pid
+
+/config/.env
+/config/config

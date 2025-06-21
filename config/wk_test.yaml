@@ -104,8 +104,8 @@ cluster:
   # 例如：
   # seed:
   #   - "1001@192.168.1.12:11110"
-  seed:
-    - "10.0.0.172:31750"
+  # seed:
+  #  - "1002@10.0.0.172:30521"
 # plugin:
 # socketPath: "./wukongimdata/1/wukongim.sock" # 插件unix socket通讯地址
 # install: # 默认安装的插件列表  安装最新版本 ${os}: 当前操作系统 ${arch}: 当前操作系统架构。github地址替换https://github.com/WuKongIM/plugins
