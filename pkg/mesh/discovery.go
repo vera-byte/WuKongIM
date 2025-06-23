@@ -38,14 +38,15 @@ type Listener interface {
 
 // Discovery 服务发现核心结构
 type Discovery struct {
-	SelfName  string
-	SelfPort  string
-	Version   string
-	Log       *wklog.WKLog
-	nodes     map[string]NodeInfo
-	mu        sync.RWMutex
-	listeners []Listener
-	shutdown  bool // 关闭标志
+	SelfName     string
+	SelfPort     string
+	Version      string
+	Log          *wklog.WKLog
+	nodes        map[string]NodeInfo
+	mu           sync.RWMutex
+	listeners    []Listener
+	shutdown     bool // 关闭标志
+	hasAnnounced bool // 是否已发送上线通知
 }
 
 func newDiscovery(selfName, selfPort string) *Discovery {
@@ -90,7 +91,52 @@ func newDiscovery(selfName, selfPort string) *Discovery {
 	go d.listenLoop()
 	go d.cleanupLoop()
 
+	// 延迟发送上线通知
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		d.Announce()
+	}()
+
 	return d
+}
+
+// Announce 发送上线通知
+func (d *Discovery) Announce() {
+	if d.hasAnnounced || d.shutdown {
+		return
+	}
+
+	d.Log.Info("发送上线通知")
+
+	broadcastIP, err := GetBroadcastIP()
+	if err != nil {
+		broadcastIP = "255.255.255.255"
+	}
+
+	addr, _ := net.ResolveUDPAddr("udp", broadcastIP+":11110")
+	conn, err := net.DialUDP("udp", nil, addr)
+	if err != nil {
+		d.Log.Error("创建上线通知连接失败", zap.Error(err))
+		return
+	}
+	defer conn.Close()
+
+	msg := map[string]interface{}{
+		"name":      d.SelfName,
+		"ip":        GetLocalIP(),
+		"port":      d.SelfPort,
+		"version":   d.Version,
+		"announce":  true, // 上线通知标志
+		"timestamp": time.Now().UnixMilli(),
+	}
+	b, _ := json.Marshal(msg)
+
+	if _, err := conn.Write(b); err != nil {
+		d.Log.Warn("发送上线通知失败", zap.Error(err))
+	} else {
+		d.Log.Info("上线通知已发送")
+		d.hasAnnounced = true
+	}
 }
 
 // Shutdown 节点关闭时调用，通知其他节点自己即将下线
@@ -170,6 +216,9 @@ func (d *Discovery) broadcastLoop() {
 		zap.String("broadcast", broadcastIP),
 		zap.String("interval", "5s"),
 	)
+
+	// 首次广播时发送上线通知
+	go d.Announce()
 
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -274,6 +323,21 @@ func (d *Discovery) handleMessage(data []byte) {
 	// 忽略自身消息
 	if name == d.SelfName {
 		return
+	}
+
+	// 检查是否为上线通知
+	if announce, ok := msg["announce"].(bool); ok && announce {
+		d.Log.Info("收到上线通知", zap.String("name", name))
+
+		// 如果这是新节点，立即回复
+		d.mu.RLock()
+		_, exists := d.nodes[name]
+		d.mu.RUnlock()
+
+		if !exists {
+			d.Log.Info("回复上线通知", zap.String("name", name))
+			go d.Announce()
+		}
 	}
 
 	// 检查是否为下线通知
