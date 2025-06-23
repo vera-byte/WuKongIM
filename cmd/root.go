@@ -19,9 +19,8 @@ import (
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/options"
-	"github.com/WuKongIM/WuKongIM/internal/server"                      // 注册 Kubernetes 集群支持
-	wk_kubernetes "github.com/WuKongIM/WuKongIM/pkg/cluster/kubernetes" // 注册 Kubernetes 集群支持
-
+	"github.com/WuKongIM/WuKongIM/internal/server"
+	wkmesh "github.com/WuKongIM/WuKongIM/pkg/mesh"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	"github.com/spf13/cobra"
@@ -297,22 +296,24 @@ func addCommand(cmd CMD) {
 	rootCmd.AddCommand(cmd.CMD())
 }
 
+// MyListener 实现 Listener 接口，打印事件
 type MyListener struct{}
 
-func (l *MyListener) OnNodeUpdate(podName, address string) {
-	fmt.Printf("节点上线或变更: %s -> %s\n", podName, address)
-	if wk_kubernetes.GlobalK8sClient == nil {
-		fmt.Println("服务发现未初始化")
-		return
-	}
+func (l *MyListener) OnNodeUpdate(node wkmesh.NodeInfo) {
+	fmt.Printf("[节点上线] %s (%s:%s)\n", node.Name, node.IP, node.Port)
 }
 
-func (l *MyListener) OnNodeDelete(podName string) {
-	fmt.Printf("节点下线: %s", podName)
+func (l *MyListener) OnNodeDelete(name string) {
+	fmt.Printf("[节点下线] %s\n", name)
 }
 func Execute() {
 	ctx := &WuKongIMContext{}
-	wk_kubernetes.StartWukongimServiceDiscovery("test", "app=wukongim", 11110, &MyListener{})
+
+	go func() {
+		mesh := wkmesh.NewMesh()
+		mesh.Discovery.RegisterListener(&MyListener{})
+	}()
+
 	addCommand(newStopCMD(ctx))
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
