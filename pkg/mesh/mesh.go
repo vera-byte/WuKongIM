@@ -7,8 +7,8 @@ import (
 )
 
 type WKMesh struct {
-	Discovery *Discovery // 服务发现模块
-	LOG       wklog.Log  // 日志记录器
+	Discovery *Discovery   // 服务发现模块
+	LOG       *wklog.WKLog // 日志记录器
 
 }
 

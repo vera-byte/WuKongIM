@@ -9,7 +9,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/WuKongIM/WuKongIM/version"
+	"go.uber.org/zap"
 	"golang.org/x/net/ipv4"
 )
 
@@ -32,10 +34,10 @@ type Listener interface {
 
 // Discovery is the core structure for service discovery
 type Discovery struct {
-	SelfName string
-	SelfPort string
-	Version  string
-
+	SelfName  string
+	SelfPort  string
+	Version   string
+	Log       *wklog.WKLog
 	nodes     map[string]NodeInfo
 	mu        sync.RWMutex
 	listeners []Listener
@@ -55,6 +57,8 @@ func newDiscovery(selfName, selfPort string) *Discovery {
 	}
 
 	discovery := &Discovery{
+		Log: wklog.NewWKLog("wkmesh.discovery"),
+
 		SelfName:  selfName,
 		SelfPort:  selfPort,
 		Version:   version.Version,
@@ -76,10 +80,10 @@ func (d *Discovery) RegisterListener(l Listener) {
 }
 
 func (d *Discovery) broadcastLoop() {
-	addr, _ := net.ResolveUDPAddr("udp", "255.255.255.255:11111")
+	addr, _ := net.ResolveUDPAddr("udp", "255.255.255.255:11110")
 	conn, err := net.DialUDP("udp", nil, addr)
 	if err != nil {
-		fmt.Println("广播失败:", err)
+		d.Log.Error("广播失败:", zap.Error(err))
 		return
 	}
 	defer conn.Close()
@@ -110,27 +114,27 @@ func (d *Discovery) broadcastLoop() {
 
 func (d *Discovery) listenLoop() {
 	group := net.IPv4(224, 0, 0, 250)
-	port := 11111
+	port := 11110
 
 	iface := getMulticastInterface()
 	if iface == nil {
-		fmt.Println("未找到有效的多播接口")
+		d.Log.Warn("未找到有效的多播接口")
 		os.Exit(1)
 	}
-	fmt.Println("使用网络接口:", iface.Name)
+	d.Log.Info("使用网络接口:", zap.String("iface", iface.Name))
 
 	udpConn, err := net.ListenUDP("udp4", &net.UDPAddr{
 		IP:   net.IPv4zero,
 		Port: port,
 	})
 	if err != nil {
-		fmt.Println("ListenUDP失败:", err)
+		d.Log.Error("ListenUDP失败:", zap.Error(err))
 		os.Exit(1)
 	}
 
 	p := ipv4.NewPacketConn(udpConn)
 	if err := p.JoinGroup(iface, &net.UDPAddr{IP: group, Zone: iface.Name}); err != nil {
-		fmt.Println("加入多播组失败:", err)
+		d.Log.Error("加入多播组失败:", zap.Error(err))
 		os.Exit(1)
 	}
 
@@ -141,7 +145,7 @@ func (d *Discovery) listenLoop() {
 	for {
 		n, _, _, err := p.ReadFrom(buf)
 		if err != nil {
-			fmt.Println("读取失败:", err)
+			d.Log.Error("读取失败:", zap.Error(err))
 			continue
 		}
 		go d.handleMessage(buf[:n], nil)
@@ -185,8 +189,14 @@ func (d *Discovery) handleMessage(data []byte, _ *net.UDPAddr) {
 	if !existed {
 		for _, l := range d.listeners {
 			// 打印节点和延迟信息
-			fmt.Printf("[发现节点] %s (%s:%s) 版本: %s, 可达: %t, 延迟: %v\n",
-				node.Name, node.IP, node.Port, node.Version, node.Reachable, node.Latency.Milliseconds())
+			d.Log.Info("发现新节点",
+				zap.String("name", node.Name),
+				zap.String("ip", node.IP),
+				zap.String("port", node.Port),
+				zap.String("version", node.Version),
+				zap.Bool("reachable", node.Reachable),
+				zap.Duration("latency", node.Latency),
+			)
 			go l.OnNodeUpdate(node)
 		}
 	}
