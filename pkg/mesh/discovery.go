@@ -17,7 +17,7 @@ import (
 	"golang.org/x/net/ipv4"
 )
 
-// NodeInfo represents node metadata
+// NodeInfo 节点信息结构
 type NodeInfo struct {
 	NodeId    uint32        `json:"node_id"`
 	Name      string        `json:"name"`
@@ -29,13 +29,13 @@ type NodeInfo struct {
 	Latency   time.Duration `json:"latency"`
 }
 
-// Listener interface to receive node events
+// Listener 节点监听器接口
 type Listener interface {
 	OnNodeUpdate(node NodeInfo)
 	OnNodeDelete(name string)
 }
 
-// Discovery is the core structure for service discovery
+// Discovery 服务发现核心结构
 type Discovery struct {
 	SelfName  string
 	SelfPort  string
@@ -47,9 +47,10 @@ type Discovery struct {
 }
 
 func newDiscovery(selfName, selfPort string) *Discovery {
-	// 添加自身节点到本地节点列表中
 	selfIP := GetLocalIP()
 	nodeId, _ := IPv4ToUint32(selfIP)
+
+	// 创建自身节点信息
 	selfNode := NodeInfo{
 		NodeId:    nodeId,
 		Name:      selfName,
@@ -61,37 +62,61 @@ func newDiscovery(selfName, selfPort string) *Discovery {
 		Latency:   0,
 	}
 
-	discovery := &Discovery{
-		Log: wklog.NewWKLog("wkmesh.discovery"),
-
+	d := &Discovery{
+		Log:       wklog.NewWKLog("WKMesh.Discovery"),
 		SelfName:  selfName,
 		SelfPort:  selfPort,
 		Version:   version.Version,
 		nodes:     make(map[string]NodeInfo),
 		listeners: make([]Listener, 0),
 	}
-	discovery.mu.Lock()
-	discovery.nodes[discovery.SelfName] = selfNode
-	discovery.mu.Unlock()
 
-	go discovery.broadcastLoop()
-	go discovery.listenLoop()
-	go discovery.cleanupLoop()
-	return discovery
+	// 添加自身节点
+	d.mu.Lock()
+	d.nodes[d.SelfName] = selfNode
+	d.mu.Unlock()
+
+	d.Log.Info("节点初始化完成",
+		zap.String("name", selfName),
+		zap.String("ip", selfIP),
+		zap.String("port", selfPort),
+	)
+
+	// 启动核心协程
+	go d.broadcastLoop()
+	go d.listenLoop()
+	go d.cleanupLoop()
+
+	return d
 }
 
+// 注册节点监听器
 func (d *Discovery) RegisterListener(l Listener) {
 	d.listeners = append(d.listeners, l)
+	d.Log.Debug("注册节点监听器", zap.Int("count", len(d.listeners)))
 }
 
+// 广播循环 - 向网络发送节点信息
 func (d *Discovery) broadcastLoop() {
-	addr, _ := net.ResolveUDPAddr("udp", "255.255.255.255:11110")
+	// 获取子网广播地址
+	broadcastIP, err := GetBroadcastIP()
+	if err != nil {
+		d.Log.Error("获取广播地址失败", zap.Error(err))
+		broadcastIP = "255.255.255.255" // 回退到全局广播
+	}
+
+	addr, _ := net.ResolveUDPAddr("udp", broadcastIP+":11110")
 	conn, err := net.DialUDP("udp", nil, addr)
 	if err != nil {
-		d.Log.Error("广播失败:", zap.Error(err))
+		d.Log.Error("创建广播连接失败", zap.Error(err))
 		return
 	}
 	defer conn.Close()
+
+	d.Log.Info("启动广播循环",
+		zap.String("broadcast", broadcastIP),
+		zap.String("interval", "5s"),
+	)
 
 	ip := GetLocalIP()
 	for {
@@ -104,9 +129,12 @@ func (d *Discovery) broadcastLoop() {
 			"timestamp": time.Now().UnixMilli(),
 		}
 		b, _ := json.Marshal(msg)
-		conn.Write(b)
 
-		// 更新自身节点 LastSeen，避免被清除
+		if _, err := conn.Write(b); err != nil {
+			d.Log.Warn("广播发送失败", zap.Error(err))
+		}
+
+		// 更新自身节点最后可见时间
 		d.mu.Lock()
 		node := d.nodes[d.SelfName]
 		node.LastSeen = time.Now()
@@ -117,64 +145,77 @@ func (d *Discovery) broadcastLoop() {
 	}
 }
 
+// 监听循环 - 接收网络中的节点信息
 func (d *Discovery) listenLoop() {
 	group := net.IPv4(224, 0, 0, 250)
 	port := 11110
 
+	// 获取多播接口
 	iface := getMulticastInterface()
 	if iface == nil {
-		d.Log.Warn("未找到有效的多播接口")
+		d.Log.Error("未找到有效的多播接口")
 		os.Exit(1)
 	}
-	d.Log.Info("使用网络接口:", zap.String("iface", iface.Name))
+	d.Log.Info("使用网络接口",
+		zap.String("name", iface.Name),
+		zap.Strings("ips", getInterfaceIPs(iface)),
+	)
 
 	udpConn, err := net.ListenUDP("udp4", &net.UDPAddr{
 		IP:   net.IPv4zero,
 		Port: port,
 	})
 	if err != nil {
-		d.Log.Error("ListenUDP失败:", zap.Error(err))
+		d.Log.Error("创建监听连接失败", zap.Error(err))
 		os.Exit(1)
 	}
+	defer udpConn.Close()
 
 	p := ipv4.NewPacketConn(udpConn)
-	if err := p.JoinGroup(iface, &net.UDPAddr{IP: group, Zone: iface.Name}); err != nil {
-		d.Log.Error("加入多播组失败:", zap.Error(err))
+	if err := p.JoinGroup(iface, &net.UDPAddr{IP: group}); err != nil {
+		d.Log.Error("加入多播组失败", zap.Error(err))
 		os.Exit(1)
 	}
 
 	_ = p.SetControlMessage(ipv4.FlagDst, true)
 	_ = udpConn.SetReadBuffer(2048)
 
+	d.Log.Info("开始监听节点广播",
+		zap.String("group", group.String()),
+		zap.Int("port", port),
+	)
+
 	buf := make([]byte, 2048)
 	for {
 		n, _, _, err := p.ReadFrom(buf)
 		if err != nil {
-			d.Log.Error("读取失败:", zap.Error(err))
+			d.Log.Warn("读取消息失败", zap.Error(err))
 			continue
 		}
-		go d.handleMessage(buf[:n], nil)
+		go d.handleMessage(buf[:n])
 	}
 }
 
-func (d *Discovery) handleMessage(data []byte, _ *net.UDPAddr) {
+// 处理接收到的节点消息
+func (d *Discovery) handleMessage(data []byte) {
 	var msg map[string]interface{}
 	if err := json.Unmarshal(data, &msg); err != nil {
+		d.Log.Warn("消息解析失败", zap.Error(err))
 		return
 	}
+
 	name, _ := msg["name"].(string)
+	// 忽略自身消息
 	if name == d.SelfName {
 		return
 	}
+
 	ip, _ := msg["ip"].(string)
 	port, _ := msg["port"].(string)
 	version, _ := msg["version"].(string)
+	restPort := "11110" // 默认REST端口
 
-	restPort := "18080"
-	if val, ok := msg["rest_port"].(string); ok && val != "" {
-		restPort = val
-	}
-
+	// 检测节点可达性
 	reachable, latency := testRESTPing(ip, restPort)
 	nodeId, _ := IPv4ToUint32(ip)
 
@@ -188,69 +229,93 @@ func (d *Discovery) handleMessage(data []byte, _ *net.UDPAddr) {
 		Reachable: reachable,
 		Latency:   latency,
 	}
+
 	d.mu.Lock()
 	_, existed := d.nodes[name]
 	d.nodes[name] = node
 	d.mu.Unlock()
 
 	if !existed {
+		d.Log.Info("发现新节点",
+			zap.String("name", node.Name),
+			zap.String("ip", node.IP),
+			zap.Duration("latency", node.Latency),
+			zap.Bool("reachable", node.Reachable),
+		)
 		for _, l := range d.listeners {
-			// 打印节点和延迟信息
-			d.Log.Info("发现新节点",
-				zap.String("name", node.Name),
-				zap.String("ip", node.IP),
-				zap.String("port", node.Port),
-				zap.String("version", node.Version),
-				zap.Bool("reachable", node.Reachable),
-				zap.Duration("latency", node.Latency),
-			)
 			go l.OnNodeUpdate(node)
 		}
+	} else {
+		d.Log.Debug("更新节点信息", zap.String("name", name))
 	}
 }
 
+// 清理过期节点
 func (d *Discovery) cleanupLoop() {
+	d.Log.Info("启动节点清理循环", zap.String("interval", "10s"))
+
 	for {
 		time.Sleep(10 * time.Second)
 		now := time.Now()
+		removed := []string{}
+
 		d.mu.Lock()
 		for name, node := range d.nodes {
 			if name == d.SelfName {
-				continue // 忽略自己
+				continue // 忽略自身
 			}
 			if now.Sub(node.LastSeen) > 15*time.Second {
 				delete(d.nodes, name)
+				removed = append(removed, name)
+			}
+		}
+		d.mu.Unlock()
+
+		// 通知监听器
+		if len(removed) > 0 {
+			d.Log.Info("清理过期节点", zap.Strings("nodes", removed))
+			for _, name := range removed {
 				for _, l := range d.listeners {
 					go l.OnNodeDelete(name)
 				}
 			}
 		}
-		d.mu.Unlock()
 	}
 }
 
+// 添加静态节点
 func (d *Discovery) AddStaticNode(ip, port string) {
 	reachable, latency := testRESTPing(ip, "11110")
 	name := fmt.Sprintf("static-%s:%s", ip, port)
 	nodeId, _ := IPv4ToUint32(ip)
 
 	node := NodeInfo{
-		NodeId: nodeId, // 静态节点没有 NodeId
-		Name:   name, IP: ip, Port: port, Version: "manual",
-		LastSeen: time.Now(), Reachable: reachable, Latency: latency,
+		NodeId:    nodeId,
+		Name:      name,
+		IP:        ip,
+		Port:      port,
+		Version:   "manual",
+		LastSeen:  time.Now(),
+		Reachable: reachable,
+		Latency:   latency,
 	}
+
 	d.mu.Lock()
 	d.nodes[name] = node
 	d.mu.Unlock()
+
+	d.Log.Info("添加静态节点", zap.String("ip", ip), zap.String("port", port))
 
 	for _, l := range d.listeners {
 		go l.OnNodeUpdate(node)
 	}
 }
 
+// 获取所有节点列表
 func (d *Discovery) ListNodes() []NodeInfo {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
+
 	list := make([]NodeInfo, 0, len(d.nodes))
 	for _, n := range d.nodes {
 		list = append(list, n)
@@ -258,63 +323,144 @@ func (d *Discovery) ListNodes() []NodeInfo {
 	return list
 }
 
-// 获取所有节点
+// 获取所有节点副本
 func (d *Discovery) GetAllNodes() map[string]NodeInfo {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
+
 	nodesCopy := make(map[string]NodeInfo, len(d.nodes))
 	maps.Copy(nodesCopy, d.nodes)
 	return nodesCopy
 }
 
+// 获取本地IP地址
 func GetLocalIP() string {
-	addrs, _ := net.InterfaceAddrs()
-	for _, addr := range addrs {
-		if ipNet, ok := addr.(*net.IPNet); ok && !ipNet.IP.IsLoopback() && ipNet.IP.To4() != nil {
-			return ipNet.IP.String()
+	if ip := os.Getenv("POD_IP"); ip != "" {
+		return ip // Kubernetes环境优先使用POD_IP
+	}
+
+	ifaces, _ := net.Interfaces()
+	for _, iface := range ifaces {
+		// 跳过本地回环和非活动接口
+		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+
+		addrs, _ := iface.Addrs()
+		for _, addr := range addrs {
+			switch v := addr.(type) {
+			case *net.IPNet:
+				if ip := v.IP.To4(); ip != nil {
+					return ip.String()
+				}
+			case *net.IPAddr:
+				if ip := v.IP.To4(); ip != nil {
+					return ip.String()
+				}
+			}
 		}
 	}
 	return "127.0.0.1"
 }
 
-func getMulticastInterface() *net.Interface {
-	preferred := []string{"en0", "en1"}
-	for _, name := range preferred {
-		iface, err := net.InterfaceByName(name)
-		if err == nil && iface.Flags&net.FlagUp != 0 && iface.Flags&net.FlagMulticast != 0 {
-			return iface
-		}
-	}
+// 获取子网广播地址
+func GetBroadcastIP() (string, error) {
 	ifaces, _ := net.Interfaces()
 	for _, iface := range ifaces {
-		if iface.Flags&net.FlagLoopback == 0 && iface.Flags&net.FlagUp != 0 && iface.Flags&net.FlagMulticast != 0 {
+		// 跳过本地回环和非活动接口
+		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+
+		addrs, _ := iface.Addrs()
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if !ok || ipNet.IP.To4() == nil {
+				continue
+			}
+
+			// 计算广播地址: IP OR (NOT mask)
+			mask := ipNet.Mask
+			ip := ipNet.IP.To4()
+			broadcast := net.IP(make([]byte, 4))
+			for i := range ip {
+				broadcast[i] = ip[i] | ^mask[i]
+			}
+			return broadcast.String(), nil
+		}
+	}
+	return "", fmt.Errorf("未找到有效接口")
+}
+
+// 获取多播网络接口
+func getMulticastInterface() *net.Interface {
+	// 优先选择Kubernetes环境常见接口
+	preferred := []string{"eth0", "en0", "en1", "enp0s1"}
+
+	for _, name := range preferred {
+		if iface, err := net.InterfaceByName(name); err == nil {
+			if iface.Flags&net.FlagUp != 0 && iface.Flags&net.FlagMulticast != 0 {
+				return iface
+			}
+		}
+	}
+
+	// 回退到所有可用接口
+	ifaces, _ := net.Interfaces()
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagLoopback == 0 &&
+			iface.Flags&net.FlagUp != 0 &&
+			iface.Flags&net.FlagMulticast != 0 {
 			return &iface
 		}
 	}
 	return nil
 }
 
+// 获取接口IP列表
+func getInterfaceIPs(iface *net.Interface) []string {
+	addrs, _ := iface.Addrs()
+	ips := make([]string, 0, len(addrs))
+	for _, addr := range addrs {
+		if ipNet, ok := addr.(*net.IPNet); ok {
+			if ip := ipNet.IP.To4(); ip != nil {
+				ips = append(ips, ip.String())
+			}
+		}
+	}
+	return ips
+}
+
+// 测试节点REST可达性
 func testRESTPing(ip, port string) (bool, time.Duration) {
-	url := fmt.Sprintf("http://%s:%s", ip, port)
+	url := fmt.Sprintf("http://%s:%s/health", ip, port)
 	client := &http.Client{Timeout: 2 * time.Second}
+
 	start := time.Now()
 	resp, err := client.Get(url)
 	if err != nil {
 		return false, 0
 	}
 	defer resp.Body.Close()
-	latency := time.Since(start)
-	return true, latency
+
+	// 仅当返回200时认为成功
+	if resp.StatusCode != http.StatusOK {
+		return false, 0
+	}
+
+	return true, time.Since(start)
 }
 
+// IP转uint32
 func IPv4ToUint32(ipStr string) (uint32, error) {
 	ip := net.ParseIP(ipStr).To4()
 	if ip == nil {
-		return 0, fmt.Errorf("无效的 IPv4 地址: %s", ipStr)
+		return 0, fmt.Errorf("无效的IPv4地址: %s", ipStr)
 	}
 	return binary.BigEndian.Uint32(ip), nil
 }
 
+// uint32转IP
 func Uint32ToIPv4(n uint32) string {
 	ip := make(net.IP, 4)
 	binary.BigEndian.PutUint32(ip, n)
