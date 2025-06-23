@@ -304,6 +304,7 @@ type MyListener struct {
 
 func (l *MyListener) OnNodeUpdate(node wkmesh.NodeInfo) {
 	l.LOG.Info("[节点上线] %s", zap.String("name", node.Name),
+		zap.Uint32("nodeId", node.NodeId),
 		zap.String("ip", node.IP),
 		zap.String("port", node.Port),
 		zap.String("version", node.Version),

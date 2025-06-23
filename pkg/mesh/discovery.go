@@ -1,6 +1,7 @@
 package wkmesh
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"maps"
@@ -18,7 +19,7 @@ import (
 
 // NodeInfo represents node metadata
 type NodeInfo struct {
-	NodeId    int64         `json:"node_id"`
+	NodeId    uint32        `json:"node_id"`
 	Name      string        `json:"name"`
 	IP        string        `json:"ip"`
 	Port      string        `json:"port"`
@@ -48,7 +49,9 @@ type Discovery struct {
 func newDiscovery(selfName, selfPort string) *Discovery {
 	// 添加自身节点到本地节点列表中
 	selfIP := GetLocalIP()
+	nodeId, _ := IPv4ToUint32(selfIP)
 	selfNode := NodeInfo{
+		NodeId:    nodeId,
 		Name:      selfName,
 		IP:        selfIP,
 		Port:      selfPort,
@@ -173,8 +176,10 @@ func (d *Discovery) handleMessage(data []byte, _ *net.UDPAddr) {
 	}
 
 	reachable, latency := testRESTPing(ip, restPort)
+	nodeId, _ := IPv4ToUint32(ip)
 
 	node := NodeInfo{
+		NodeId:    nodeId,
 		Name:      name,
 		IP:        ip,
 		Port:      port,
@@ -227,8 +232,11 @@ func (d *Discovery) cleanupLoop() {
 func (d *Discovery) AddStaticNode(ip, port string) {
 	reachable, latency := testRESTPing(ip, "11110")
 	name := fmt.Sprintf("static-%s:%s", ip, port)
+	nodeId, _ := IPv4ToUint32(ip)
+
 	node := NodeInfo{
-		Name: name, IP: ip, Port: port, Version: "manual",
+		NodeId: nodeId, // 静态节点没有 NodeId
+		Name:   name, IP: ip, Port: port, Version: "manual",
 		LastSeen: time.Now(), Reachable: reachable, Latency: latency,
 	}
 	d.mu.Lock()
@@ -297,4 +305,18 @@ func testRESTPing(ip, port string) (bool, time.Duration) {
 	defer resp.Body.Close()
 	latency := time.Since(start)
 	return true, latency
+}
+
+func IPv4ToUint32(ipStr string) (uint32, error) {
+	ip := net.ParseIP(ipStr).To4()
+	if ip == nil {
+		return 0, fmt.Errorf("无效的 IPv4 地址: %s", ipStr)
+	}
+	return binary.BigEndian.Uint32(ip), nil
+}
+
+func Uint32ToIPv4(n uint32) string {
+	ip := make(net.IP, 4)
+	binary.BigEndian.PutUint32(ip, n)
+	return ip.String()
 }
