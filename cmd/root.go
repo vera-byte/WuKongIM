@@ -307,9 +307,9 @@ func (l *MyListener) OnNodeUpdate(node wkmesh.NodeInfo) {
 		zap.String("ip", node.IP),
 		zap.String("port", node.Port),
 		zap.String("version", node.Version),
-		zap.Time("lastSeen", node.LastSeen),
+		zap.Int64("lastSeen", node.LastSeen.UnixMicro()),
 		zap.Bool("reachable", node.Reachable),
-		zap.Duration("latency", node.Latency),
+		zap.Duration("latency", time.Duration(node.Latency.Milliseconds())),
 	)
 	// 输出所有节点
 	nodes := l.WKMesh.Discovery.ListNodes()
@@ -335,7 +335,7 @@ func Execute() {
 	go func() {
 		mesh := wkmesh.NewMesh()
 		mesh.Discovery.RegisterListener(&MyListener{
-			LOG:    mesh.LOG,
+			LOG:    mesh.Discovery.Log,
 			WKMesh: mesh,
 		})
 	}()

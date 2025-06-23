@@ -18,6 +18,7 @@ import (
 
 // NodeInfo represents node metadata
 type NodeInfo struct {
+	NodeId    int64         `json:"node_id"`
 	Name      string        `json:"name"`
 	IP        string        `json:"ip"`
 	Port      string        `json:"port"`
@@ -96,7 +97,7 @@ func (d *Discovery) broadcastLoop() {
 			"ip":        ip,
 			"port":      d.SelfPort,
 			"version":   d.Version,
-			"rest_port": "18080",
+			"rest_port": "11110",
 			"timestamp": time.Now().UnixMilli(),
 		}
 		b, _ := json.Marshal(msg)
@@ -224,7 +225,7 @@ func (d *Discovery) cleanupLoop() {
 }
 
 func (d *Discovery) AddStaticNode(ip, port string) {
-	reachable, latency := testRESTPing(ip, "18080")
+	reachable, latency := testRESTPing(ip, "11110")
 	name := fmt.Sprintf("static-%s:%s", ip, port)
 	node := NodeInfo{
 		Name: name, IP: ip, Port: port, Version: "manual",
@@ -286,7 +287,7 @@ func getMulticastInterface() *net.Interface {
 }
 
 func testRESTPing(ip, port string) (bool, time.Duration) {
-	url := fmt.Sprintf("http://%s:%s/ping", ip, port)
+	url := fmt.Sprintf("http://%s:%s", ip, port)
 	client := &http.Client{Timeout: 2 * time.Second}
 	start := time.Now()
 	resp, err := client.Get(url)
