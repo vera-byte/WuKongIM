@@ -27,6 +27,7 @@ type NodeInfo struct {
 	LastSeen  time.Time     `json:"-"`
 	Reachable bool          `json:"reachable"`
 	Latency   time.Duration `json:"latency"`
+	Status    string        `json:"status"` // 状态: "online", "offline"
 }
 
 // Listener 节点监听器接口
@@ -44,6 +45,7 @@ type Discovery struct {
 	nodes     map[string]NodeInfo
 	mu        sync.RWMutex
 	listeners []Listener
+	shutdown  bool // 关闭标志
 }
 
 func newDiscovery(selfName, selfPort string) *Discovery {
@@ -60,6 +62,7 @@ func newDiscovery(selfName, selfPort string) *Discovery {
 		LastSeen:  time.Now(),
 		Reachable: true,
 		Latency:   0,
+		Status:    "online",
 	}
 
 	d := &Discovery{
@@ -90,6 +93,56 @@ func newDiscovery(selfName, selfPort string) *Discovery {
 	return d
 }
 
+// Shutdown 节点关闭时调用，通知其他节点自己即将下线
+func (d *Discovery) Shutdown() {
+	if d.shutdown {
+		return
+	}
+	d.shutdown = true
+
+	d.Log.Info("节点正在关闭，发送下线通知")
+
+	// 发送下线广播
+	broadcastIP, err := GetBroadcastIP()
+	if err != nil {
+		broadcastIP = "255.255.255.255"
+	}
+	addr, _ := net.ResolveUDPAddr("udp", broadcastIP+":11110")
+	conn, err := net.DialUDP("udp", nil, addr)
+	if err != nil {
+		d.Log.Error("创建下线通知连接失败", zap.Error(err))
+		return
+	}
+	defer conn.Close()
+
+	msg := map[string]interface{}{
+		"name":      d.SelfName,
+		"ip":        GetLocalIP(),
+		"port":      d.SelfPort,
+		"version":   d.Version,
+		"shutdown":  true, // 下线标志
+		"timestamp": time.Now().UnixMilli(),
+	}
+	b, _ := json.Marshal(msg)
+
+	if _, err := conn.Write(b); err != nil {
+		d.Log.Warn("发送下线通知失败", zap.Error(err))
+	} else {
+		d.Log.Info("下线通知已发送")
+	}
+
+	// 更新自身状态为下线
+	d.mu.Lock()
+	if node, ok := d.nodes[d.SelfName]; ok {
+		node.Status = "offline"
+		d.nodes[d.SelfName] = node
+	}
+	d.mu.Unlock()
+
+	// 等待一小段时间确保消息发送
+	time.Sleep(500 * time.Millisecond)
+}
+
 // 注册节点监听器
 func (d *Discovery) RegisterListener(l Listener) {
 	d.listeners = append(d.listeners, l)
@@ -118,30 +171,39 @@ func (d *Discovery) broadcastLoop() {
 		zap.String("interval", "5s"),
 	)
 
-	ip := GetLocalIP()
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
 	for {
-		msg := map[string]interface{}{
-			"name":      d.SelfName,
-			"ip":        ip,
-			"port":      d.SelfPort,
-			"version":   d.Version,
-			"rest_port": "11110",
-			"timestamp": time.Now().UnixMilli(),
+		select {
+		case <-ticker.C:
+			if d.shutdown {
+				d.Log.Info("广播循环退出")
+				return
+			}
+
+			ip := GetLocalIP()
+			msg := map[string]interface{}{
+				"name":      d.SelfName,
+				"ip":        ip,
+				"port":      d.SelfPort,
+				"version":   d.Version,
+				"rest_port": "11110",
+				"timestamp": time.Now().UnixMilli(),
+			}
+			b, _ := json.Marshal(msg)
+
+			if _, err := conn.Write(b); err != nil {
+				d.Log.Warn("广播发送失败", zap.Error(err))
+			}
+
+			// 更新自身节点最后可见时间
+			d.mu.Lock()
+			node := d.nodes[d.SelfName]
+			node.LastSeen = time.Now()
+			d.nodes[d.SelfName] = node
+			d.mu.Unlock()
 		}
-		b, _ := json.Marshal(msg)
-
-		if _, err := conn.Write(b); err != nil {
-			d.Log.Warn("广播发送失败", zap.Error(err))
-		}
-
-		// 更新自身节点最后可见时间
-		d.mu.Lock()
-		node := d.nodes[d.SelfName]
-		node.LastSeen = time.Now()
-		d.nodes[d.SelfName] = node
-		d.mu.Unlock()
-
-		time.Sleep(5 * time.Second)
 	}
 }
 
@@ -186,14 +248,18 @@ func (d *Discovery) listenLoop() {
 	)
 
 	buf := make([]byte, 2048)
-	for {
+	for !d.shutdown {
 		n, _, _, err := p.ReadFrom(buf)
 		if err != nil {
+			if d.shutdown {
+				break
+			}
 			d.Log.Warn("读取消息失败", zap.Error(err))
 			continue
 		}
 		go d.handleMessage(buf[:n])
 	}
+	d.Log.Info("监听循环退出")
 }
 
 // 处理接收到的节点消息
@@ -207,6 +273,25 @@ func (d *Discovery) handleMessage(data []byte) {
 	name, _ := msg["name"].(string)
 	// 忽略自身消息
 	if name == d.SelfName {
+		return
+	}
+
+	// 检查是否为下线通知
+	if shutdown, ok := msg["shutdown"].(bool); ok && shutdown {
+		d.Log.Info("收到下线通知", zap.String("name", name))
+
+		d.mu.Lock()
+		if node, exists := d.nodes[name]; exists {
+			node.Status = "offline"                           // 标记为下线状态
+			node.LastSeen = time.Now().Add(-30 * time.Second) // 立即触发清理
+			d.nodes[name] = node
+		}
+		d.mu.Unlock()
+
+		// 立即触发节点删除通知
+		for _, l := range d.listeners {
+			go l.OnNodeDelete(name)
+		}
 		return
 	}
 
@@ -228,10 +313,16 @@ func (d *Discovery) handleMessage(data []byte) {
 		LastSeen:  time.Now(),
 		Reachable: reachable,
 		Latency:   latency,
+		Status:    "online", // 默认为在线状态
 	}
 
 	d.mu.Lock()
-	_, existed := d.nodes[name]
+	existed := false
+	if existingNode, ok := d.nodes[name]; ok {
+		// 保留现有状态（如果存在）
+		node.Status = existingNode.Status
+		existed = true
+	}
 	d.nodes[name] = node
 	d.mu.Unlock()
 
@@ -254,33 +345,48 @@ func (d *Discovery) handleMessage(data []byte) {
 func (d *Discovery) cleanupLoop() {
 	d.Log.Info("启动节点清理循环", zap.String("interval", "10s"))
 
-	for {
-		time.Sleep(10 * time.Second)
-		now := time.Now()
-		removed := []string{}
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
 
-		d.mu.Lock()
-		for name, node := range d.nodes {
-			if name == d.SelfName {
-				continue // 忽略自身
-			}
-			if now.Sub(node.LastSeen) > 15*time.Second {
-				delete(d.nodes, name)
-				removed = append(removed, name)
-			}
-		}
-		d.mu.Unlock()
+	for !d.shutdown {
+		select {
+		case <-ticker.C:
+			now := time.Now()
+			removed := []string{}
 
-		// 通知监听器
-		if len(removed) > 0 {
-			d.Log.Info("清理过期节点", zap.Strings("nodes", removed))
-			for _, name := range removed {
-				for _, l := range d.listeners {
-					go l.OnNodeDelete(name)
+			d.mu.Lock()
+			for name, node := range d.nodes {
+				if name == d.SelfName {
+					continue // 忽略自身
+				}
+
+				// 对于标记为下线的节点，立即清理
+				if node.Status == "offline" {
+					delete(d.nodes, name)
+					removed = append(removed, name)
+					continue
+				}
+
+				// 正常节点超时清理
+				if now.Sub(node.LastSeen) > 15*time.Second {
+					delete(d.nodes, name)
+					removed = append(removed, name)
+				}
+			}
+			d.mu.Unlock()
+
+			// 通知监听器
+			if len(removed) > 0 {
+				d.Log.Info("清理过期节点", zap.Strings("nodes", removed))
+				for _, name := range removed {
+					for _, l := range d.listeners {
+						go l.OnNodeDelete(name)
+					}
 				}
 			}
 		}
 	}
+	d.Log.Info("清理循环退出")
 }
 
 // 添加静态节点
@@ -298,6 +404,7 @@ func (d *Discovery) AddStaticNode(ip, port string) {
 		LastSeen:  time.Now(),
 		Reachable: reachable,
 		Latency:   latency,
+		Status:    "online",
 	}
 
 	d.mu.Lock()

@@ -2,6 +2,10 @@ package wkmesh
 
 import (
 	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"go.uber.org/zap"
@@ -29,8 +33,20 @@ func NewMesh() *WKMesh {
 	}
 	log.Info("发现模块创建成功", zap.String("node", name))
 
-	return &WKMesh{
+	mesh := &WKMesh{
 		Discovery: discovery,
 		LOG:       log,
 	}
+
+	// 添加优雅关闭处理
+	go func() {
+		c := make(chan os.Signal, 1)
+		signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+		<-c
+		mesh.Discovery.Shutdown()
+		time.Sleep(1 * time.Second) // 等待下线通知发送
+		os.Exit(0)
+	}()
+
+	return mesh
 }
