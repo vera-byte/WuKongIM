@@ -48,3 +48,4 @@ wukongim.pid
 
 /config/.env
 /config/config
+/debug/*
