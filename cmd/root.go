@@ -297,21 +297,47 @@ func addCommand(cmd CMD) {
 }
 
 // MyListener 实现 Listener 接口，打印事件
-type MyListener struct{}
+type MyListener struct {
+	LOG    *wklog.WKLog // 日志记录器
+	WKMesh *wkmesh.WKMesh
+}
 
 func (l *MyListener) OnNodeUpdate(node wkmesh.NodeInfo) {
-	fmt.Printf("[节点上线] %s (%s:%s)\n", node.Name, node.IP, node.Port)
+	l.LOG.Info("[节点上线] %s", zap.String("name", node.Name),
+		zap.String("ip", node.IP),
+		zap.String("port", node.Port),
+		zap.String("version", node.Version),
+		zap.Time("lastSeen", node.LastSeen),
+		zap.Bool("reachable", node.Reachable),
+		zap.Duration("latency", node.Latency),
+	)
+	// 输出所有节点
+	nodes := l.WKMesh.Discovery.ListNodes()
+	l.LOG.Info("当前所有节点",
+		zap.Int("count", len(nodes)),
+		zap.Any("nodes", nodes),
+	)
 }
 
 func (l *MyListener) OnNodeDelete(name string) {
 	fmt.Printf("[节点下线] %s\n", name)
+	// 输出所有节点
+	nodes := l.WKMesh.Discovery.ListNodes()
+	l.LOG.Info("当前剩余节点",
+		zap.Int("count", len(nodes)),
+		zap.Any("nodes", nodes),
+	)
 }
+
 func Execute() {
 	ctx := &WuKongIMContext{}
 
 	go func() {
 		mesh := wkmesh.NewMesh()
-		mesh.Discovery.RegisterListener(&MyListener{})
+		mesh.Discovery.RegisterListener(&MyListener{
+			LOG:    mesh.LOG,
+			WKMesh: mesh,
+		})
 	}()
 
 	addCommand(newStopCMD(ctx))

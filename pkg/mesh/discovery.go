@@ -3,6 +3,7 @@ package wkmesh
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net"
 	"net/http"
 	"os"
@@ -246,6 +247,15 @@ func (d *Discovery) ListNodes() []NodeInfo {
 		list = append(list, n)
 	}
 	return list
+}
+
+// 获取所有节点
+func (d *Discovery) GetAllNodes() map[string]NodeInfo {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	nodesCopy := make(map[string]NodeInfo, len(d.nodes))
+	maps.Copy(nodesCopy, d.nodes)
+	return nodesCopy
 }
 
 func GetLocalIP() string {
