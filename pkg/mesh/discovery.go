@@ -358,7 +358,7 @@ func (d *Discovery) multicastLoop() {
 	d.Log.Info("启动多播广播循环", zap.String("interval", "5s"))
 
 	multicastAddr := &net.UDPAddr{
-		IP:   net.IPv4zero,
+		IP:   net.IPv4allrouter,
 		Port: 11110,
 	}
 
@@ -434,7 +434,7 @@ func (d *Discovery) Announce() {
 	} else {
 		// 非 Kubernetes 使用多播
 		multicastAddr := &net.UDPAddr{
-			IP:   net.IPv4(224, 0, 0, 250),
+			IP:   net.IPv4allrouter,
 			Port: 11110,
 		}
 
@@ -548,7 +548,7 @@ func (d *Discovery) listenLoop() {
 	}
 
 	addr := &net.UDPAddr{
-		IP:   net.IPv4zero,
+		IP:   net.IPv4allrouter,
 		Port: 11110,
 	}
 
