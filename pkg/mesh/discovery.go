@@ -347,7 +347,7 @@ func (d *Discovery) multicastLoop() {
 	d.Log.Info("启动多播广播循环", zap.String("interval", "5s"))
 
 	multicastAddr := &net.UDPAddr{
-		IP:   net.IPv4(224, 0, 0, 250),
+		IP:   net.IPv4zero,
 		Port: 11110,
 	}
 
@@ -362,30 +362,28 @@ func (d *Discovery) multicastLoop() {
 	defer ticker.Stop()
 
 	for !d.shutdown {
-		select {
-		case <-ticker.C:
-			ip := GetLocalIP()
-			msg := map[string]interface{}{
-				"name":      d.SelfName,
-				"ip":        ip,
-				"port":      d.SelfPort,
-				"version":   d.Version,
-				"rest_port": "11110",
-				"timestamp": time.Now().UnixMilli(),
-			}
-			b, _ := json.Marshal(msg)
-
-			if _, err := conn.Write(b); err != nil {
-				d.Log.Warn("多播广播发送失败", zap.Error(err))
-			}
-
-			// 更新自身节点最后可见时间
-			d.mu.Lock()
-			node := d.nodes[d.SelfName]
-			node.LastSeen = time.Now()
-			d.nodes[d.SelfName] = node
-			d.mu.Unlock()
+		<-ticker.C
+		ip := GetLocalIP()
+		msg := map[string]interface{}{
+			"name":      d.SelfName,
+			"ip":        ip,
+			"port":      d.SelfPort,
+			"version":   d.Version,
+			"rest_port": "11110",
+			"timestamp": time.Now().UnixMilli(),
 		}
+		b, _ := json.Marshal(msg)
+
+		if _, err := conn.Write(b); err != nil {
+			d.Log.Warn("多播广播发送失败", zap.Error(err))
+		}
+
+		// 更新自身节点最后可见时间
+		d.mu.Lock()
+		node := d.nodes[d.SelfName]
+		node.LastSeen = time.Now()
+		d.nodes[d.SelfName] = node
+		d.mu.Unlock()
 	}
 }
 
