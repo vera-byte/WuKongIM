@@ -88,7 +88,7 @@ func newDiscovery(selfName, selfPort string) *Discovery {
 		LastSeen:  time.Now(),
 		Reachable: true,
 		Latency:   0,
-		Status:    "online",
+		Status:    NodeStatusOnline,
 	}
 
 	d := &Discovery{
@@ -317,7 +317,7 @@ func (d *Discovery) unicastLoop() {
 				Timestamp: time.Now().UnixMilli(),
 			}
 
-			if err := d.unicastSend(node.IP, 11110, msg); err != nil {
+			if err := d.sendUDPMessage(node.IP, 11110, msg); err != nil {
 				d.Log.Debug("单播发送失败",
 					zap.String("target", node.IP),
 					zap.Error(err),
@@ -334,23 +334,26 @@ func (d *Discovery) unicastLoop() {
 	}
 }
 
-// 单播发送消息
-func (d *Discovery) unicastSend(ip string, port int, msg *UDPBody) error {
+// 发送UDP消息
+func (d *Discovery) sendUDPMessage(ip string, port int, msg *UDPBody) error {
 	addr := fmt.Sprintf("%s:%d", ip, port)
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
-		return err
+		return fmt.Errorf("解析UDP地址失败: %w", err)
 	}
 
 	conn, err := net.DialUDP("udp", nil, udpAddr)
 	if err != nil {
-		return err
+		return fmt.Errorf("建立UDP连接失败: %w", err)
 	}
 	defer conn.Close()
 
 	b, _ := json.Marshal(msg)
-	_, err = conn.Write(b)
-	return err
+	if _, err := conn.Write(b); err != nil {
+		return fmt.Errorf("发送消息失败: %w", err)
+	}
+
+	return nil
 }
 
 // 多播广播循环
@@ -424,7 +427,7 @@ func (d *Discovery) Announce() {
 				Timestamp: time.Now().UnixMilli(),
 			}
 
-			if err := d.unicastSend(node.IP, 11110, msg); err != nil {
+			if err := d.sendUDPMessage(node.IP, 11110, msg); err != nil {
 				d.Log.Warn("上线通知发送失败",
 					zap.String("target", node.IP),
 					zap.Error(err),
@@ -491,7 +494,7 @@ func (d *Discovery) Shutdown() {
 				Timestamp: time.Now().UnixMilli(),
 			}
 
-			if err := d.unicastSend(node.IP, 11110, msg); err != nil {
+			if err := d.sendUDPMessage(node.IP, 11110, msg); err != nil {
 				d.Log.Warn("下线通知发送失败",
 					zap.String("target", node.IP),
 					zap.Error(err),
@@ -532,7 +535,7 @@ func (d *Discovery) Shutdown() {
 	// 更新自身状态为下线
 	d.mu.Lock()
 	if node, ok := d.nodes[d.SelfName]; ok {
-		node.Status = "offline"
+		node.Status = NodeStatusOffline
 		d.nodes[d.SelfName] = node
 	}
 	d.mu.Unlock()
@@ -623,7 +626,7 @@ func (d *Discovery) handleMessage(data []byte, _ *net.UDPAddr) {
 
 		d.mu.Lock()
 		if node, exists := d.nodes[msg.Name]; exists {
-			node.Status = "offline"                           // 标记为下线状态
+			node.Status = NodeStatusOffline                   // 标记为下线状态
 			node.LastSeen = time.Now().Add(-30 * time.Second) // 立即触发清理
 			d.nodes[msg.Name] = node
 		}
@@ -649,7 +652,7 @@ func (d *Discovery) handleMessage(data []byte, _ *net.UDPAddr) {
 		LastSeen:  time.Now(),
 		Reachable: reachable,
 		Latency:   latency,
-		Status:    "online", // 默认为在线状态
+		Status:    NodeStatusOnline, // 默认为在线状态
 	}
 
 	d.mu.Lock()
@@ -696,7 +699,7 @@ func (d *Discovery) cleanupLoop() {
 			}
 
 			// 对于标记为下线的节点，立即清理
-			if node.Status == "offline" {
+			if node.Status == NodeStatusOffline {
 				delete(d.nodes, name)
 				removed = append(removed, name)
 				continue
@@ -744,7 +747,7 @@ func (d *Discovery) AddStaticNode(ip, port string) {
 		LastSeen:  time.Now(),
 		Reachable: reachable,
 		Latency:   latency,
-		Status:    "online",
+		Status:    NodeStatusOnline,
 	}
 
 	d.mu.Lock()
