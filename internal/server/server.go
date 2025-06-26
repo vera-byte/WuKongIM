@@ -490,3 +490,8 @@ func (s *Server) userLeaderId(uid string) uint64 {
 func (s *Server) WithRequestTimeout() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(s.ctx, s.opts.Cluster.ReqTimeout)
 }
+
+// 暴露 GetClusterConfigServer 方法，供外部获取集群配置服务
+func (s *Server) GetClusterConfigServer() *clusterconfig.Server {
+	return s.clusterServer.GetConfigServer()
+}

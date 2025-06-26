@@ -121,6 +121,8 @@ func cmdRun() error {
 		}
 		// 等待集群准备好
 		s.MustWaitAllSlotsReady(time.Minute)
+		// 启动网格服务
+		wkmesh.NewMesh().WithSetServer(s)
 
 		// 处理 pingback (如果提供了)
 		if pingback != "" {
@@ -296,50 +298,8 @@ func addCommand(cmd CMD) {
 	rootCmd.AddCommand(cmd.CMD())
 }
 
-// MyListener 实现 Listener 接口，打印事件
-type MyListener struct {
-	LOG    *wklog.WKLog // 日志记录器
-	WKMesh *wkmesh.WKMesh
-}
-
-func (l *MyListener) OnNodeUpdate(node wkmesh.NodeInfo) {
-	l.LOG.Info("[节点上线] %s", zap.String("name", node.Name),
-		zap.Uint32("nodeId", node.NodeId),
-		zap.String("ip", node.IP),
-		zap.String("port", node.Port),
-		zap.String("version", node.Version),
-		zap.Int64("lastSeen", node.LastSeen.UnixMicro()),
-		zap.Bool("reachable", node.Reachable),
-		zap.Duration("latency", time.Duration(node.Latency.Milliseconds())),
-	)
-	// 输出所有节点
-	nodes := l.WKMesh.Discovery.ListNodes()
-	l.LOG.Info("当前所有节点",
-		zap.Int("count", len(nodes)),
-		zap.Any("nodes", nodes),
-	)
-}
-
-func (l *MyListener) OnNodeDelete(name string) {
-	fmt.Printf("[节点下线] %s\n", name)
-	// 输出所有节点
-	nodes := l.WKMesh.Discovery.ListNodes()
-	l.LOG.Info("当前剩余节点",
-		zap.Int("count", len(nodes)),
-		zap.Any("nodes", nodes),
-	)
-}
-
 func Execute() {
 	ctx := &WuKongIMContext{}
-
-	go func() {
-		mesh := wkmesh.NewMesh()
-		mesh.Discovery.RegisterListener(&MyListener{
-			LOG:    mesh.Discovery.Log,
-			WKMesh: mesh,
-		})
-	}()
 
 	addCommand(newStopCMD(ctx))
 	if err := rootCmd.Execute(); err != nil {

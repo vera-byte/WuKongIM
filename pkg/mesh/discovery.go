@@ -1,9 +1,10 @@
 package wkmesh
 
 import (
-	"encoding/binary"
+	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"maps"
 	"net"
 	"net/http"
@@ -11,10 +12,21 @@ import (
 	"sync"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"github.com/WuKongIM/WuKongIM/version"
 	"go.uber.org/zap"
-	"golang.org/x/net/ipv4"
+)
+
+type NodeStatus string
+
+const (
+	NodeStatusOnline  NodeStatus = "online"  // 在线状态
+	NodeStatusOffline NodeStatus = "offline" // 离线状态
 )
 
 // NodeInfo 节点信息结构
@@ -27,7 +39,7 @@ type NodeInfo struct {
 	LastSeen  time.Time     `json:"-"`
 	Reachable bool          `json:"reachable"`
 	Latency   time.Duration `json:"latency"`
-	Status    string        `json:"status"` // 状态: "online", "offline"
+	Status    NodeStatus    `json:"status"` // 状态: "online", "offline"
 }
 
 // Listener 节点监听器接口
@@ -47,11 +59,13 @@ type Discovery struct {
 	listeners    []Listener
 	shutdown     bool // 关闭标志
 	hasAnnounced bool // 是否已发送上线通知
+	isK8sEnv     bool // 是否在 Kubernetes 环境中
+	k8sClient    *kubernetes.Clientset
 }
 
 func newDiscovery(selfName, selfPort string) *Discovery {
 	selfIP := GetLocalIP()
-	nodeId, _ := IPv4ToUint32(selfIP)
+	nodeId, _ := HashIPTo1024(selfIP)
 
 	// 创建自身节点信息
 	selfNode := NodeInfo{
@@ -73,6 +87,7 @@ func newDiscovery(selfName, selfPort string) *Discovery {
 		Version:   version.Version,
 		nodes:     make(map[string]NodeInfo),
 		listeners: make([]Listener, 0),
+		isK8sEnv:  os.Getenv("KUBERNETES_SERVICE_HOST") != "",
 	}
 
 	// 添加自身节点
@@ -84,20 +99,294 @@ func newDiscovery(selfName, selfPort string) *Discovery {
 		zap.String("name", selfName),
 		zap.String("ip", selfIP),
 		zap.String("port", selfPort),
+		zap.Bool("k8s", d.isK8sEnv),
+		zap.String("test", os.Getenv("KUBERNETES_SERVICE_HOST")),
 	)
 
 	// 启动核心协程
-	go d.broadcastLoop()
-	go d.listenLoop()
 	go d.cleanupLoop()
+
+	// Kubernetes 环境特殊处理
+	if d.isK8sEnv {
+		d.Log.Info("运行在Kubernetes环境中")
+
+		// 初始化 Kubernetes 客户端
+		if err := d.initK8sClient(); err != nil {
+			d.Log.Error("Kubernetes客户端初始化失败", zap.Error(err))
+		} else {
+			// 启动 Kubernetes 发现循环
+			go d.k8sDiscoveryLoop()
+
+			// 立即执行一次发现
+			go d.discoverK8sPods()
+		}
+
+		// 启动单播循环
+		go d.unicastLoop()
+	} else {
+		// 非 Kubernetes 环境使用多播
+		go d.multicastLoop()
+		go d.listenLoop()
+	}
 
 	// 延迟发送上线通知
 	go func() {
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(1 * time.Second)
 		d.Announce()
 	}()
 
 	return d
+}
+
+// 初始化 Kubernetes 客户端
+func (d *Discovery) initK8sClient() error {
+	// 创建集群内配置
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		return fmt.Errorf("创建集群内配置失败: %w", err)
+	}
+
+	// 创建客户端
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return fmt.Errorf("创建Kubernetes客户端失败: %w", err)
+	}
+
+	d.k8sClient = clientset
+	d.Log.Info("Kubernetes客户端初始化成功")
+	return nil
+}
+
+// 动态发现 Kubernetes Pod
+func (d *Discovery) discoverK8sPods() {
+	if d.k8sClient == nil {
+		return
+	}
+
+	// 获取命名空间
+	namespace := os.Getenv("POD_NAMESPACE")
+	if namespace == "" {
+		// 尝试从 service account 获取
+		if data, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace"); err == nil {
+			namespace = string(data)
+		} else {
+			namespace = "default"
+			d.Log.Warn("无法获取命名空间，使用默认值", zap.String("namespace", namespace))
+		}
+	}
+
+	// 获取标签选择器
+	selector := os.Getenv("MESH_POD_SELECTOR")
+	if selector == "" {
+		selector = "app=wukong-im"
+		d.Log.Info("使用默认标签选择器", zap.String("selector", selector))
+	}
+
+	d.Log.Debug("发现Kubernetes Pod",
+		zap.String("namespace", namespace),
+		zap.String("selector", selector),
+	)
+
+	// 获取 Pod 列表
+	pods, err := d.k8sClient.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{
+		LabelSelector: selector,
+	})
+	if err != nil {
+		d.Log.Error("获取Pod列表失败", zap.Error(err))
+		return
+	}
+
+	d.Log.Info("发现Kubernetes Pod", zap.Int("count", len(pods.Items)))
+
+	// 处理发现的 Pod
+	for _, pod := range pods.Items {
+		// 跳过自身
+		if pod.Status.PodIP == GetLocalIP() {
+			continue
+		}
+
+		// 跳过非运行状态的 Pod
+		if pod.Status.Phase != corev1.PodRunning {
+			d.Log.Debug("跳过非运行状态Pod",
+				zap.String("name", pod.Name),
+				zap.String("phase", string(pod.Status.Phase)),
+			)
+			continue
+		}
+
+		// 获取端口
+		port := os.Getenv("MESH_PORT")
+		if port == "" {
+			port = "11110"
+		}
+
+		// 检查容器中是否有自定义端口设置
+		if len(pod.Spec.Containers) > 0 {
+			for _, env := range pod.Spec.Containers[0].Env {
+				if env.Name == "MESH_PORT" {
+					port = env.Value
+					break
+				}
+			}
+		}
+
+		// 添加或更新节点
+		d.addOrUpdateNode(NodeInfo{
+			Name:      pod.Name,
+			IP:        pod.Status.PodIP,
+			Port:      port,
+			Version:   "",
+			LastSeen:  time.Now(),
+			Reachable: true, // 假设可达，后续会检查
+		})
+	}
+}
+
+// 添加或更新节点
+func (d *Discovery) addOrUpdateNode(node NodeInfo) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// 如果节点不存在或信息有变化，则更新
+	if existing, ok := d.nodes[node.Name]; !ok ||
+		existing.IP != node.IP ||
+		existing.Port != node.Port {
+
+		d.nodes[node.Name] = node
+		d.Log.Info("添加/更新节点",
+			zap.String("name", node.Name),
+			zap.String("ip", node.IP),
+			zap.String("port", node.Port),
+		)
+
+		// 通知监听器
+		for _, l := range d.listeners {
+			go l.OnNodeUpdate(node)
+		}
+	}
+}
+
+// 定期发现循环
+func (d *Discovery) k8sDiscoveryLoop() {
+	d.Log.Info("启动Kubernetes发现循环", zap.String("interval", "30s"))
+
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for !d.shutdown {
+		<-ticker.C
+		d.discoverK8sPods()
+	}
+}
+
+// 单播广播循环
+func (d *Discovery) unicastLoop() {
+	d.Log.Info("启动单播广播循环", zap.String("interval", "5s"))
+
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for !d.shutdown {
+		<-ticker.C
+		// 获取所有已知节点
+		nodes := d.GetAllNodes()
+
+		// 向所有节点发送更新
+		for _, node := range nodes {
+			if node.Name == d.SelfName {
+				continue // 跳过自身
+			}
+
+			msg := map[string]interface{}{
+				"name":      d.SelfName,
+				"ip":        GetLocalIP(),
+				"port":      d.SelfPort,
+				"version":   d.Version,
+				"rest_port": "11110",
+				"timestamp": time.Now().UnixMilli(),
+			}
+
+			if err := d.unicastSend(node.IP, 11110, msg); err != nil {
+				d.Log.Debug("单播发送失败",
+					zap.String("target", node.IP),
+					zap.Error(err),
+				)
+			}
+		}
+
+		// 更新自身节点最后可见时间
+		d.mu.Lock()
+		node := d.nodes[d.SelfName]
+		node.LastSeen = time.Now()
+		d.nodes[d.SelfName] = node
+		d.mu.Unlock()
+	}
+}
+
+// 单播发送消息
+func (d *Discovery) unicastSend(ip string, port int, msg map[string]interface{}) error {
+	addr := fmt.Sprintf("%s:%d", ip, port)
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return err
+	}
+
+	conn, err := net.DialUDP("udp", nil, udpAddr)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	b, _ := json.Marshal(msg)
+	_, err = conn.Write(b)
+	return err
+}
+
+// 多播广播循环
+func (d *Discovery) multicastLoop() {
+	d.Log.Info("启动多播广播循环", zap.String("interval", "5s"))
+
+	multicastAddr := &net.UDPAddr{
+		IP:   net.IPv4(224, 0, 0, 250),
+		Port: 11110,
+	}
+
+	conn, err := net.DialUDP("udp", nil, multicastAddr)
+	if err != nil {
+		d.Log.Error("创建多播广播连接失败", zap.Error(err))
+		return
+	}
+	defer conn.Close()
+
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for !d.shutdown {
+		select {
+		case <-ticker.C:
+			ip := GetLocalIP()
+			msg := map[string]interface{}{
+				"name":      d.SelfName,
+				"ip":        ip,
+				"port":      d.SelfPort,
+				"version":   d.Version,
+				"rest_port": "11110",
+				"timestamp": time.Now().UnixMilli(),
+			}
+			b, _ := json.Marshal(msg)
+
+			if _, err := conn.Write(b); err != nil {
+				d.Log.Warn("多播广播发送失败", zap.Error(err))
+			}
+
+			// 更新自身节点最后可见时间
+			d.mu.Lock()
+			node := d.nodes[d.SelfName]
+			node.LastSeen = time.Now()
+			d.nodes[d.SelfName] = node
+			d.mu.Unlock()
+		}
+	}
 }
 
 // Announce 发送上线通知
@@ -108,35 +397,62 @@ func (d *Discovery) Announce() {
 
 	d.Log.Info("发送上线通知")
 
-	broadcastIP, err := GetBroadcastIP()
-	if err != nil {
-		broadcastIP = "255.255.255.255"
-	}
+	// Kubernetes 环境使用单播，非 Kubernetes 使用多播
+	if d.isK8sEnv {
+		// 向所有已知节点发送上线通知
+		nodes := d.GetAllNodes()
+		for _, node := range nodes {
+			if node.Name == d.SelfName {
+				continue
+			}
 
-	addr, _ := net.ResolveUDPAddr("udp", broadcastIP+":11110")
-	conn, err := net.DialUDP("udp", nil, addr)
-	if err != nil {
-		d.Log.Error("创建上线通知连接失败", zap.Error(err))
-		return
-	}
-	defer conn.Close()
+			msg := map[string]interface{}{
+				"name":      d.SelfName,
+				"ip":        GetLocalIP(),
+				"port":      d.SelfPort,
+				"version":   d.Version,
+				"announce":  true,
+				"timestamp": time.Now().UnixMilli(),
+			}
 
-	msg := map[string]interface{}{
-		"name":      d.SelfName,
-		"ip":        GetLocalIP(),
-		"port":      d.SelfPort,
-		"version":   d.Version,
-		"announce":  true, // 上线通知标志
-		"timestamp": time.Now().UnixMilli(),
-	}
-	b, _ := json.Marshal(msg)
-
-	if _, err := conn.Write(b); err != nil {
-		d.Log.Warn("发送上线通知失败", zap.Error(err))
+			if err := d.unicastSend(node.IP, 11110, msg); err != nil {
+				d.Log.Warn("上线通知发送失败",
+					zap.String("target", node.IP),
+					zap.Error(err),
+				)
+			}
+		}
 	} else {
-		d.Log.Info("上线通知已发送")
-		d.hasAnnounced = true
+		// 非 Kubernetes 使用多播
+		multicastAddr := &net.UDPAddr{
+			IP:   net.IPv4(224, 0, 0, 250),
+			Port: 11110,
+		}
+
+		conn, err := net.DialUDP("udp", nil, multicastAddr)
+		if err != nil {
+			d.Log.Error("创建多播连接失败", zap.Error(err))
+			return
+		}
+		defer conn.Close()
+
+		msg := map[string]interface{}{
+			"name":      d.SelfName,
+			"ip":        GetLocalIP(),
+			"port":      d.SelfPort,
+			"version":   d.Version,
+			"announce":  true,
+			"timestamp": time.Now().UnixMilli(),
+		}
+		b, _ := json.Marshal(msg)
+
+		if _, err := conn.Write(b); err != nil {
+			d.Log.Warn("发送上线通知失败", zap.Error(err))
+		}
 	}
+
+	d.Log.Info("上线通知已发送")
+	d.hasAnnounced = true
 }
 
 // Shutdown 节点关闭时调用，通知其他节点自己即将下线
@@ -148,34 +464,61 @@ func (d *Discovery) Shutdown() {
 
 	d.Log.Info("节点正在关闭，发送下线通知")
 
-	// 发送下线广播
-	broadcastIP, err := GetBroadcastIP()
-	if err != nil {
-		broadcastIP = "255.255.255.255"
-	}
-	addr, _ := net.ResolveUDPAddr("udp", broadcastIP+":11110")
-	conn, err := net.DialUDP("udp", nil, addr)
-	if err != nil {
-		d.Log.Error("创建下线通知连接失败", zap.Error(err))
-		return
-	}
-	defer conn.Close()
+	// Kubernetes 环境使用单播，非 Kubernetes 使用多播
+	if d.isK8sEnv {
+		// 向所有已知节点发送下线通知
+		nodes := d.GetAllNodes()
+		for _, node := range nodes {
+			if node.Name == d.SelfName {
+				continue
+			}
 
-	msg := map[string]interface{}{
-		"name":      d.SelfName,
-		"ip":        GetLocalIP(),
-		"port":      d.SelfPort,
-		"version":   d.Version,
-		"shutdown":  true, // 下线标志
-		"timestamp": time.Now().UnixMilli(),
-	}
-	b, _ := json.Marshal(msg)
+			msg := map[string]interface{}{
+				"name":      d.SelfName,
+				"ip":        GetLocalIP(),
+				"port":      d.SelfPort,
+				"version":   d.Version,
+				"shutdown":  true,
+				"timestamp": time.Now().UnixMilli(),
+			}
 
-	if _, err := conn.Write(b); err != nil {
-		d.Log.Warn("发送下线通知失败", zap.Error(err))
+			if err := d.unicastSend(node.IP, 11110, msg); err != nil {
+				d.Log.Warn("下线通知发送失败",
+					zap.String("target", node.IP),
+					zap.Error(err),
+				)
+			}
+		}
 	} else {
-		d.Log.Info("下线通知已发送")
+		// 非 Kubernetes 使用多播
+		multicastAddr := &net.UDPAddr{
+			IP:   net.IPv4(224, 0, 0, 250),
+			Port: 11110,
+		}
+
+		conn, err := net.DialUDP("udp", nil, multicastAddr)
+		if err != nil {
+			d.Log.Error("创建多播连接失败", zap.Error(err))
+			return
+		}
+		defer conn.Close()
+
+		msg := map[string]interface{}{
+			"name":      d.SelfName,
+			"ip":        GetLocalIP(),
+			"port":      d.SelfPort,
+			"version":   d.Version,
+			"shutdown":  true,
+			"timestamp": time.Now().UnixMilli(),
+		}
+		b, _ := json.Marshal(msg)
+
+		if _, err := conn.Write(b); err != nil {
+			d.Log.Warn("发送下线通知失败", zap.Error(err))
+		}
 	}
+
+	d.Log.Info("下线通知已发送")
 
 	// 更新自身状态为下线
 	d.mu.Lock()
@@ -189,130 +532,50 @@ func (d *Discovery) Shutdown() {
 	time.Sleep(500 * time.Millisecond)
 }
 
-// 注册节点监听器
-func (d *Discovery) RegisterListener(l Listener) {
-	d.listeners = append(d.listeners, l)
-	d.Log.Debug("注册节点监听器", zap.Int("count", len(d.listeners)))
-}
-
-// 广播循环 - 向网络发送节点信息
-func (d *Discovery) broadcastLoop() {
-	// 获取子网广播地址
-	broadcastIP, err := GetBroadcastIP()
-	if err != nil {
-		d.Log.Error("获取广播地址失败", zap.Error(err))
-		broadcastIP = "255.255.255.255" // 回退到全局广播
+// 监听循环 - 接收网络中的节点信息
+func (d *Discovery) listenLoop() {
+	if d.isK8sEnv {
+		return // Kubernetes 环境不需要多播监听
 	}
 
-	addr, _ := net.ResolveUDPAddr("udp", broadcastIP+":11110")
-	conn, err := net.DialUDP("udp", nil, addr)
+	addr := &net.UDPAddr{
+		IP:   net.IPv4zero,
+		Port: 11110,
+	}
+
+	conn, err := net.ListenUDP("udp", addr)
 	if err != nil {
-		d.Log.Error("创建广播连接失败", zap.Error(err))
+		d.Log.Error("创建监听连接失败", zap.Error(err))
 		return
 	}
 	defer conn.Close()
 
-	d.Log.Info("启动广播循环",
-		zap.String("broadcast", broadcastIP),
-		zap.String("interval", "5s"),
-	)
-
-	// 首次广播时发送上线通知
-	go d.Announce()
-
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			if d.shutdown {
-				d.Log.Info("广播循环退出")
-				return
-			}
-
-			ip := GetLocalIP()
-			msg := map[string]interface{}{
-				"name":      d.SelfName,
-				"ip":        ip,
-				"port":      d.SelfPort,
-				"version":   d.Version,
-				"rest_port": "11110",
-				"timestamp": time.Now().UnixMilli(),
-			}
-			b, _ := json.Marshal(msg)
-
-			if _, err := conn.Write(b); err != nil {
-				d.Log.Warn("广播发送失败", zap.Error(err))
-			}
-
-			// 更新自身节点最后可见时间
-			d.mu.Lock()
-			node := d.nodes[d.SelfName]
-			node.LastSeen = time.Now()
-			d.nodes[d.SelfName] = node
-			d.mu.Unlock()
-		}
-	}
-}
-
-// 监听循环 - 接收网络中的节点信息
-func (d *Discovery) listenLoop() {
-	group := net.IPv4(224, 0, 0, 250)
-	port := 11110
-
-	// 获取多播接口
-	iface := getMulticastInterface()
-	if iface == nil {
-		d.Log.Error("未找到有效的多播接口")
-		os.Exit(1)
-	}
-	d.Log.Info("使用网络接口",
-		zap.String("name", iface.Name),
-		zap.Strings("ips", getInterfaceIPs(iface)),
-	)
-
-	udpConn, err := net.ListenUDP("udp4", &net.UDPAddr{
-		IP:   net.IPv4zero,
-		Port: port,
-	})
-	if err != nil {
-		d.Log.Error("创建监听连接失败", zap.Error(err))
-		os.Exit(1)
-	}
-	defer udpConn.Close()
-
-	p := ipv4.NewPacketConn(udpConn)
-	if err := p.JoinGroup(iface, &net.UDPAddr{IP: group}); err != nil {
-		d.Log.Error("加入多播组失败", zap.Error(err))
-		os.Exit(1)
-	}
-
-	_ = p.SetControlMessage(ipv4.FlagDst, true)
-	_ = udpConn.SetReadBuffer(2048)
-
 	d.Log.Info("开始监听节点广播",
-		zap.String("group", group.String()),
-		zap.Int("port", port),
+		zap.String("address", addr.String()),
 	)
 
 	buf := make([]byte, 2048)
 	for !d.shutdown {
-		n, _, _, err := p.ReadFrom(buf)
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		n, addr, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			if d.shutdown {
 				break
 			}
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
 			d.Log.Warn("读取消息失败", zap.Error(err))
 			continue
 		}
-		go d.handleMessage(buf[:n])
+
+		go d.handleMessage(buf[:n], addr)
 	}
 	d.Log.Info("监听循环退出")
 }
 
 // 处理接收到的节点消息
-func (d *Discovery) handleMessage(data []byte) {
+func (d *Discovery) handleMessage(data []byte, addr *net.UDPAddr) {
 	var msg map[string]interface{}
 	if err := json.Unmarshal(data, &msg); err != nil {
 		d.Log.Warn("消息解析失败", zap.Error(err))
@@ -366,7 +629,7 @@ func (d *Discovery) handleMessage(data []byte) {
 
 	// 检测节点可达性
 	reachable, latency := testRESTPing(ip, restPort)
-	nodeId, _ := IPv4ToUint32(ip)
+	nodeId, _ := HashIPTo1024(ip)
 
 	node := NodeInfo{
 		NodeId:    nodeId,
@@ -413,39 +676,37 @@ func (d *Discovery) cleanupLoop() {
 	defer ticker.Stop()
 
 	for !d.shutdown {
-		select {
-		case <-ticker.C:
-			now := time.Now()
-			removed := []string{}
+		<-ticker.C
+		now := time.Now()
+		removed := []string{}
 
-			d.mu.Lock()
-			for name, node := range d.nodes {
-				if name == d.SelfName {
-					continue // 忽略自身
-				}
-
-				// 对于标记为下线的节点，立即清理
-				if node.Status == "offline" {
-					delete(d.nodes, name)
-					removed = append(removed, name)
-					continue
-				}
-
-				// 正常节点超时清理
-				if now.Sub(node.LastSeen) > 15*time.Second {
-					delete(d.nodes, name)
-					removed = append(removed, name)
-				}
+		d.mu.Lock()
+		for name, node := range d.nodes {
+			if name == d.SelfName {
+				continue // 忽略自身
 			}
-			d.mu.Unlock()
 
-			// 通知监听器
-			if len(removed) > 0 {
-				d.Log.Info("清理过期节点", zap.Strings("nodes", removed))
-				for _, name := range removed {
-					for _, l := range d.listeners {
-						go l.OnNodeDelete(name)
-					}
+			// 对于标记为下线的节点，立即清理
+			if node.Status == "offline" {
+				delete(d.nodes, name)
+				removed = append(removed, name)
+				continue
+			}
+
+			// 正常节点超时清理
+			if now.Sub(node.LastSeen) > 30*time.Second {
+				delete(d.nodes, name)
+				removed = append(removed, name)
+			}
+		}
+		d.mu.Unlock()
+
+		// 通知监听器
+		if len(removed) > 0 {
+			d.Log.Info("清理过期节点", zap.Strings("nodes", removed))
+			for _, name := range removed {
+				for _, l := range d.listeners {
+					go l.OnNodeDelete(name)
 				}
 			}
 		}
@@ -453,11 +714,17 @@ func (d *Discovery) cleanupLoop() {
 	d.Log.Info("清理循环退出")
 }
 
+// 注册节点监听器
+func (d *Discovery) RegisterListener(l Listener) {
+	d.listeners = append(d.listeners, l)
+	d.Log.Debug("注册节点监听器", zap.Int("count", len(d.listeners)))
+}
+
 // 添加静态节点
 func (d *Discovery) AddStaticNode(ip, port string) {
 	reachable, latency := testRESTPing(ip, "11110")
 	name := fmt.Sprintf("static-%s:%s", ip, port)
-	nodeId, _ := IPv4ToUint32(ip)
+	nodeId, _ := HashIPTo1024(ip)
 
 	node := NodeInfo{
 		NodeId:    nodeId,
@@ -534,74 +801,6 @@ func GetLocalIP() string {
 	return "127.0.0.1"
 }
 
-// 获取子网广播地址
-func GetBroadcastIP() (string, error) {
-	ifaces, _ := net.Interfaces()
-	for _, iface := range ifaces {
-		// 跳过本地回环和非活动接口
-		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
-			continue
-		}
-
-		addrs, _ := iface.Addrs()
-		for _, addr := range addrs {
-			ipNet, ok := addr.(*net.IPNet)
-			if !ok || ipNet.IP.To4() == nil {
-				continue
-			}
-
-			// 计算广播地址: IP OR (NOT mask)
-			mask := ipNet.Mask
-			ip := ipNet.IP.To4()
-			broadcast := net.IP(make([]byte, 4))
-			for i := range ip {
-				broadcast[i] = ip[i] | ^mask[i]
-			}
-			return broadcast.String(), nil
-		}
-	}
-	return "", fmt.Errorf("未找到有效接口")
-}
-
-// 获取多播网络接口
-func getMulticastInterface() *net.Interface {
-	// 优先选择Kubernetes环境常见接口
-	preferred := []string{"eth0", "en0", "en1", "enp0s1"}
-
-	for _, name := range preferred {
-		if iface, err := net.InterfaceByName(name); err == nil {
-			if iface.Flags&net.FlagUp != 0 && iface.Flags&net.FlagMulticast != 0 {
-				return iface
-			}
-		}
-	}
-
-	// 回退到所有可用接口
-	ifaces, _ := net.Interfaces()
-	for _, iface := range ifaces {
-		if iface.Flags&net.FlagLoopback == 0 &&
-			iface.Flags&net.FlagUp != 0 &&
-			iface.Flags&net.FlagMulticast != 0 {
-			return &iface
-		}
-	}
-	return nil
-}
-
-// 获取接口IP列表
-func getInterfaceIPs(iface *net.Interface) []string {
-	addrs, _ := iface.Addrs()
-	ips := make([]string, 0, len(addrs))
-	for _, addr := range addrs {
-		if ipNet, ok := addr.(*net.IPNet); ok {
-			if ip := ipNet.IP.To4(); ip != nil {
-				ips = append(ips, ip.String())
-			}
-		}
-	}
-	return ips
-}
-
 // 测试节点REST可达性
 func testRESTPing(ip, port string) (bool, time.Duration) {
 	url := fmt.Sprintf("http://%s:%s/health", ip, port)
@@ -622,18 +821,12 @@ func testRESTPing(ip, port string) (bool, time.Duration) {
 	return true, time.Since(start)
 }
 
-// IP转uint32
-func IPv4ToUint32(ipStr string) (uint32, error) {
-	ip := net.ParseIP(ipStr).To4()
-	if ip == nil {
-		return 0, fmt.Errorf("无效的IPv4地址: %s", ipStr)
+// IP转
+func HashIPTo1024(ipStr string) (uint32, error) {
+	h := fnv.New32a()
+	_, err := h.Write([]byte(ipStr))
+	if err != nil {
+		return 0, err
 	}
-	return binary.BigEndian.Uint32(ip), nil
-}
-
-// uint32转IP
-func Uint32ToIPv4(n uint32) string {
-	ip := make(net.IP, 4)
-	binary.BigEndian.PutUint32(ip, n)
-	return ip.String()
+	return uint32(h.Sum32() % 1024), nil
 }
