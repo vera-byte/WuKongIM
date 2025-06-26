@@ -29,6 +29,17 @@ const (
 	NodeStatusOffline NodeStatus = "offline" // 离线状态
 )
 
+type UDPBody struct {
+	Name      string `json:"name"`      // 节点名称
+	IP        string `json:"ip"`        // 节点IP地址
+	Port      string `json:"port"`      // 节点端口
+	Version   string `json:"version"`   // 节点版本
+	RestPort  string `json:"rest_port"` // REST端口
+	Timestamp int64  `json:"timestamp"` // 时间戳
+	Announce  bool   `json:"announce"`  // 是否为上线通知
+	Shutdown  bool   `json:"shutdown"`  // 是否为下线通知
+}
+
 // NodeInfo 节点信息结构
 type NodeInfo struct {
 	NodeId    uint32        `json:"node_id"`
@@ -297,13 +308,13 @@ func (d *Discovery) unicastLoop() {
 				continue // 跳过自身
 			}
 
-			msg := map[string]interface{}{
-				"name":      d.SelfName,
-				"ip":        GetLocalIP(),
-				"port":      d.SelfPort,
-				"version":   d.Version,
-				"rest_port": "11110",
-				"timestamp": time.Now().UnixMilli(),
+			msg := &UDPBody{
+				Name:      d.SelfName,
+				IP:        GetLocalIP(),
+				Port:      d.SelfPort,
+				Version:   d.Version,
+				RestPort:  "11110",
+				Timestamp: time.Now().UnixMilli(),
 			}
 
 			if err := d.unicastSend(node.IP, 11110, msg); err != nil {
@@ -324,7 +335,7 @@ func (d *Discovery) unicastLoop() {
 }
 
 // 单播发送消息
-func (d *Discovery) unicastSend(ip string, port int, msg map[string]interface{}) error {
+func (d *Discovery) unicastSend(ip string, port int, msg *UDPBody) error {
 	addr := fmt.Sprintf("%s:%d", ip, port)
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
@@ -404,13 +415,13 @@ func (d *Discovery) Announce() {
 				continue
 			}
 
-			msg := map[string]interface{}{
-				"name":      d.SelfName,
-				"ip":        GetLocalIP(),
-				"port":      d.SelfPort,
-				"version":   d.Version,
-				"announce":  true,
-				"timestamp": time.Now().UnixMilli(),
+			msg := &UDPBody{
+				Name:      d.SelfName,
+				IP:        GetLocalIP(),
+				Port:      d.SelfPort,
+				Version:   d.Version,
+				Announce:  true,
+				Timestamp: time.Now().UnixMilli(),
 			}
 
 			if err := d.unicastSend(node.IP, 11110, msg); err != nil {
@@ -471,13 +482,13 @@ func (d *Discovery) Shutdown() {
 				continue
 			}
 
-			msg := map[string]interface{}{
-				"name":      d.SelfName,
-				"ip":        GetLocalIP(),
-				"port":      d.SelfPort,
-				"version":   d.Version,
-				"shutdown":  true,
-				"timestamp": time.Now().UnixMilli(),
+			msg := &UDPBody{
+				Name:      d.SelfName,
+				IP:        GetLocalIP(),
+				Port:      d.SelfPort,
+				Version:   d.Version,
+				Shutdown:  true,
+				Timestamp: time.Now().UnixMilli(),
 			}
 
 			if err := d.unicastSend(node.IP, 11110, msg); err != nil {
@@ -573,68 +584,68 @@ func (d *Discovery) listenLoop() {
 }
 
 // 处理接收到的节点消息
-func (d *Discovery) handleMessage(data []byte, addr *net.UDPAddr) {
-	var msg map[string]interface{}
+func (d *Discovery) handleMessage(data []byte, _ *net.UDPAddr) {
+	var msg UDPBody
 	if err := json.Unmarshal(data, &msg); err != nil {
 		d.Log.Warn("消息解析失败", zap.Error(err))
 		return
 	}
-
-	name, _ := msg["name"].(string)
+	if msg.Version != version.Version {
+		d.Log.Warn("收到不同版本的节点消息,版本不一致不能加入统一节点",
+			zap.String("received_version", msg.Version),
+			zap.String("expected_version", version.Version),
+		)
+		return
+	}
 	// 忽略自身消息
-	if name == d.SelfName {
+	if msg.Name == d.SelfName {
 		return
 	}
 
 	// 检查是否为上线通知
-	if announce, ok := msg["announce"].(bool); ok && announce {
-		d.Log.Info("收到上线通知", zap.String("name", name))
+	if msg.Announce {
+		d.Log.Info("收到上线通知", zap.String("name", msg.Name))
 
 		// 如果这是新节点，立即回复
 		d.mu.RLock()
-		_, exists := d.nodes[name]
+		_, exists := d.nodes[msg.Name]
 		d.mu.RUnlock()
 
 		if !exists {
-			d.Log.Info("回复上线通知", zap.String("name", name))
+			d.Log.Info("回复上线通知", zap.String("name", msg.Name))
 			go d.Announce()
 		}
 	}
 
 	// 检查是否为下线通知
-	if shutdown, ok := msg["shutdown"].(bool); ok && shutdown {
-		d.Log.Info("收到下线通知", zap.String("name", name))
+	if msg.Shutdown {
+		d.Log.Info("收到下线通知", zap.String("name", msg.Name))
 
 		d.mu.Lock()
-		if node, exists := d.nodes[name]; exists {
+		if node, exists := d.nodes[msg.Name]; exists {
 			node.Status = "offline"                           // 标记为下线状态
 			node.LastSeen = time.Now().Add(-30 * time.Second) // 立即触发清理
-			d.nodes[name] = node
+			d.nodes[msg.Name] = node
 		}
 		d.mu.Unlock()
 
 		// 立即触发节点删除通知
 		for _, l := range d.listeners {
-			go l.OnNodeDelete(name)
+			go l.OnNodeDelete(msg.Name)
 		}
 		return
 	}
 
-	ip, _ := msg["ip"].(string)
-	port, _ := msg["port"].(string)
-	version, _ := msg["version"].(string)
-	restPort := "11110" // 默认REST端口
-
 	// 检测节点可达性
-	reachable, latency := testRESTPing(ip, restPort)
-	nodeId, _ := HashIPTo1024(ip)
+	reachable, latency := testRESTPing(msg.IP, msg.RestPort)
+	nodeId, _ := HashIPTo1024(msg.IP)
 
 	node := NodeInfo{
 		NodeId:    nodeId,
-		Name:      name,
-		IP:        ip,
-		Port:      port,
-		Version:   version,
+		Name:      msg.Name,
+		IP:        msg.IP,
+		Port:      msg.Port,
+		Version:   msg.Version,
 		LastSeen:  time.Now(),
 		Reachable: reachable,
 		Latency:   latency,
@@ -643,12 +654,12 @@ func (d *Discovery) handleMessage(data []byte, addr *net.UDPAddr) {
 
 	d.mu.Lock()
 	existed := false
-	if existingNode, ok := d.nodes[name]; ok {
+	if existingNode, ok := d.nodes[msg.Name]; ok {
 		// 保留现有状态（如果存在）
 		node.Status = existingNode.Status
 		existed = true
 	}
-	d.nodes[name] = node
+	d.nodes[msg.Name] = node
 	d.mu.Unlock()
 
 	if !existed {
@@ -662,7 +673,7 @@ func (d *Discovery) handleMessage(data []byte, addr *net.UDPAddr) {
 			go l.OnNodeUpdate(node)
 		}
 	} else {
-		d.Log.Debug("更新节点信息", zap.String("name", name))
+		d.Log.Debug("更新节点信息", zap.String("name", msg.Name))
 	}
 }
 
