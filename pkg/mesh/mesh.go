@@ -94,6 +94,7 @@ func NewMesh() *WKMesh {
 		LOG:    mesh.Discovery.Log,
 		WKMesh: mesh,
 	})
+	// discovery.AddStaticNode("10.0.0.221", "11110")
 	// 添加优雅关闭处理
 	go func() {
 		c := make(chan os.Signal, 1)
