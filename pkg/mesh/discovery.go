@@ -515,13 +515,13 @@ func (d *Discovery) Shutdown() {
 		}
 		defer conn.Close()
 
-		msg := map[string]interface{}{
-			"name":      d.SelfName,
-			"ip":        GetLocalIP(),
-			"port":      d.SelfPort,
-			"version":   d.Version,
-			"shutdown":  true,
-			"timestamp": time.Now().UnixMilli(),
+		msg := &UDPBody{
+			Name:      d.SelfName,
+			IP:        GetLocalIP(),
+			Port:      d.SelfPort,
+			Version:   d.Version,
+			Shutdown:  true,
+			Timestamp: time.Now().UnixMilli(),
 		}
 		b, _ := json.Marshal(msg)
 
@@ -547,19 +547,22 @@ func (d *Discovery) Shutdown() {
 // 监听循环 - 接收网络中的节点信息
 func (d *Discovery) listenLoop() {
 	if d.isK8sEnv {
-		return // Kubernetes 环境不需要多播监听
+		return
 	}
 
 	addr := &net.UDPAddr{
-		IP:   net.IPv4allrouter,
+		IP:   net.IPv4(224, 0, 0, 250),
 		Port: 11110,
 	}
 
-	conn, err := net.ListenUDP("udp", addr)
+	// 尝试绑定所有网卡
+	conn, err := net.ListenMulticastUDP("udp", nil, addr)
 	if err != nil {
-		d.Log.Error("创建监听连接失败", zap.Error(err))
+		d.Log.Error("创建多播监听失败", zap.Error(err))
 		return
 	}
+	conn.SetReadBuffer(2048)
+
 	defer conn.Close()
 
 	d.Log.Info("开始监听节点广播",
@@ -569,7 +572,7 @@ func (d *Discovery) listenLoop() {
 	buf := make([]byte, 2048)
 	for !d.shutdown {
 		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		n, addr, err := conn.ReadFromUDP(buf)
+		n, src, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			if d.shutdown {
 				break
@@ -577,12 +580,13 @@ func (d *Discovery) listenLoop() {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				continue
 			}
-			d.Log.Warn("读取消息失败", zap.Error(err))
+			d.Log.Warn("读取UDP消息失败", zap.Error(err))
 			continue
 		}
 
-		go d.handleMessage(buf[:n], addr)
+		go d.handleMessage(buf[:n], src)
 	}
+
 	d.Log.Info("监听循环退出")
 }
 
@@ -786,17 +790,27 @@ func (d *Discovery) GetAllNodes() map[string]NodeInfo {
 // 获取本地IP地址
 func GetLocalIP() string {
 	if ip := os.Getenv("POD_IP"); ip != "" {
-		return ip // Kubernetes环境优先使用POD_IP
+		return ip
 	}
 
-	ifaces, _ := net.Interfaces()
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return "127.0.0.1"
+	}
+
 	for _, iface := range ifaces {
-		// 跳过本地回环和非活动接口
-		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		// 优先 eth0/ens33
+		if iface.Name != "eth0" && iface.Name != "ens33" {
 			continue
 		}
 
-		addrs, _ := iface.Addrs()
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
 		for _, addr := range addrs {
 			switch v := addr.(type) {
 			case *net.IPNet:
@@ -810,6 +824,30 @@ func GetLocalIP() string {
 			}
 		}
 	}
+
+	// fallback: 任意非回环地址
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			switch v := addr.(type) {
+			case *net.IPNet:
+				if ip := v.IP.To4(); ip != nil {
+					return ip.String()
+				}
+			case *net.IPAddr:
+				if ip := v.IP.To4(); ip != nil {
+					return ip.String()
+				}
+			}
+		}
+	}
+
 	return "127.0.0.1"
 }
 
