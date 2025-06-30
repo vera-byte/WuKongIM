@@ -75,44 +75,44 @@ type Discovery struct {
 }
 
 func newDiscovery(selfName, selfPort string) *Discovery {
-	selfIP := GetLocalIP()
-	nodeId, _ := HashIPTo1024(selfIP)
+	// selfIP := GetLocalIP()
+	// nodeId, _ := HashIPTo1024(selfIP)
 
-	// 创建自身节点信息
-	selfNode := NodeInfo{
-		NodeId:    nodeId,
-		Name:      selfName,
-		IP:        selfIP,
-		Port:      selfPort,
-		Version:   version.Version,
-		LastSeen:  time.Now(),
-		Reachable: true,
-		Latency:   0,
-		Status:    NodeStatusOnline,
-	}
+	// // 创建自身节点信息
+	// selfNode := NodeInfo{
+	// 	NodeId:    nodeId,
+	// 	Name:      selfName,
+	// 	IP:        selfIP,
+	// 	Port:      selfPort,
+	// 	Version:   version.Version,
+	// 	LastSeen:  time.Now(),
+	// 	Reachable: true,
+	// 	Latency:   0,
+	// 	Status:    NodeStatusOnline,
+	// }
 
 	d := &Discovery{
-		Log:       wklog.NewWKLog("WKMesh.Discovery"),
-		SelfName:  selfName,
-		SelfPort:  selfPort,
+		Log: wklog.NewWKLog("WKMesh.Discovery"),
+		// SelfName:  selfName,
+		// SelfPort:  selfPort,
 		Version:   version.Version,
 		nodes:     make(map[string]NodeInfo),
 		listeners: make([]Listener, 0),
 		isK8sEnv:  os.Getenv("KUBERNETES_SERVICE_HOST") != "",
 	}
 
-	// 添加自身节点
-	d.mu.Lock()
-	d.nodes[d.SelfName] = selfNode
-	d.mu.Unlock()
+	// // 添加自身节点
+	// d.mu.Lock()
+	// d.nodes[d.SelfName] = selfNode
+	// d.mu.Unlock()
 
-	d.Log.Info("节点初始化完成",
-		zap.String("name", selfName),
-		zap.String("ip", selfIP),
-		zap.String("port", selfPort),
-		zap.Bool("k8s", d.isK8sEnv),
-		zap.String("test", os.Getenv("KUBERNETES_SERVICE_HOST")),
-	)
+	// d.Log.Info("节点初始化完成",
+	// 	zap.String("name", selfName),
+	// 	zap.String("ip", selfIP),
+	// 	zap.String("port", selfPort),
+	// 	zap.Bool("k8s", d.isK8sEnv),
+	// 	zap.String("test", os.Getenv("KUBERNETES_SERVICE_HOST")),
+	// )
 
 	// 启动核心协程
 	go d.cleanupLoop()
@@ -213,7 +213,8 @@ func (d *Discovery) discoverK8sPods() {
 	for _, pod := range pods.Items {
 		// 跳过自身
 		if pod.Status.PodIP == GetLocalIP() {
-			continue
+			d.Log.Info("发现自身Pod")
+			// continue
 		}
 
 		// 跳过非运行状态的 Pod
@@ -378,13 +379,13 @@ func (d *Discovery) multicastLoop() {
 	for !d.shutdown {
 		<-ticker.C
 		ip := GetLocalIP()
-		msg := map[string]interface{}{
-			"name":      d.SelfName,
-			"ip":        ip,
-			"port":      d.SelfPort,
-			"version":   d.Version,
-			"rest_port": "11110",
-			"timestamp": time.Now().UnixMilli(),
+		msg := &UDPBody{
+			Name:      d.SelfName,
+			IP:        ip,
+			Port:      d.SelfPort,
+			Version:   d.Version,
+			Announce:  true,
+			Timestamp: time.Now().UnixMilli(),
 		}
 		b, _ := json.Marshal(msg)
 
@@ -448,13 +449,13 @@ func (d *Discovery) Announce() {
 		}
 		defer conn.Close()
 
-		msg := map[string]interface{}{
-			"name":      d.SelfName,
-			"ip":        GetLocalIP(),
-			"port":      d.SelfPort,
-			"version":   d.Version,
-			"announce":  true,
-			"timestamp": time.Now().UnixMilli(),
+		msg := &UDPBody{
+			Name:      d.SelfName,
+			IP:        GetLocalIP(),
+			Port:      d.SelfPort,
+			Version:   d.Version,
+			Announce:  true,
+			Timestamp: time.Now().UnixMilli(),
 		}
 		b, _ := json.Marshal(msg)
 

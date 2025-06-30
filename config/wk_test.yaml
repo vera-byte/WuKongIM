@@ -84,28 +84,28 @@ jwt: # jwt配置
 #   prometheusApiUrl: "http://xx.xx.xx.xx:9090" # prometheus的内网地址,用于获取监控数据
 
 # 集群配置
-cluster:
-  nodeId: 1001 # 节点ID
-  addr: "tcp://0.0.0.0:11110" # 分布式监听地址
-  serverAddr: "" # 节点之间能访问到的内网通讯地址 例如：xx.xx.xx.xx:11110
-  apiUrl: "" # 节点的http地址 内网地址，节点之间需要能访问到 格式： http://ip:port 例如：http://xx.xx.xx.xx:5001
-  slotCount: 64 # 槽位（分区）数量，默认是64个
-  slotReplicaCount: 3 # 槽位（分区）副本数量，默认是3个
-  channelReplicaCount: 3 # 频道副本数量，默认是3个
-  # 初始节点列表 格式 nodeId@ip:port，分布式初始化时的节点列表，列表包含本节点自己
-  # 例如：
-  # initNodes:
-  #   - "1001@192.168.1.12:11110"
-  #   - "1002@192.168.1.13:11110"
-  #   - "1003@192.168.1.14:11110"
-  # initNodes:
-  #   - ""
-  # 集群种子节点地址 格式 nodeId@ip:port
-  # 例如：
-  # seed:
-  #   - "1001@192.168.1.12:11110"
-  # seed:
-  #  - "1002@10.0.0.172:30521"
+# cluster:
+#   nodeId: 1001 # 节点ID
+#   addr: "tcp://0.0.0.0:11110" # 分布式监听地址
+#   serverAddr: "" # 节点之间能访问到的内网通讯地址 例如：xx.xx.xx.xx:11110
+#   apiUrl: "" # 节点的http地址 内网地址，节点之间需要能访问到 格式： http://ip:port 例如：http://xx.xx.xx.xx:5001
+#   slotCount: 64 # 槽位（分区）数量，默认是64个
+#   slotReplicaCount: 3 # 槽位（分区）副本数量，默认是3个
+#   channelReplicaCount: 3 # 频道副本数量，默认是3个
+# 初始节点列表 格式 nodeId@ip:port，分布式初始化时的节点列表，列表包含本节点自己
+# 例如：
+# initNodes:
+#   - "1001@192.168.1.12:11110"
+#   - "1002@192.168.1.13:11110"
+#   - "1003@192.168.1.14:11110"
+# initNodes:
+#   - ""
+# 集群种子节点地址 格式 nodeId@ip:port
+# 例如：
+# seed:
+#   - "1001@192.168.1.12:11110"
+# seed:
+#  - "1002@10.0.0.172:30521"
 # plugin:
 # socketPath: "./wukongimdata/1/wukongim.sock" # 插件unix socket通讯地址
 # install: # 默认安装的插件列表  安装最新版本 ${os}: 当前操作系统 ${arch}: 当前操作系统架构。github地址替换https://github.com/WuKongIM/plugins

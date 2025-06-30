@@ -67,6 +67,11 @@ func (l *MyListener) OnNodeDelete(name string) {
 
 func (m *WKMesh) WithSetServer(server *server.Server) {
 	m.Server = server
+	opts := server.GetClusterConfigServer().Options()
+	m.LOG.Info("正在添加静态节点", zap.Any("nodes:", opts.InitNodes))
+	for _, n := range opts.InitNodes {
+		m.Discovery.AddStaticNode(n, "11110")
+	}
 }
 
 // NewMesh 创建并初始化WKMesh实例
@@ -94,7 +99,7 @@ func NewMesh() *WKMesh {
 		LOG:    mesh.Discovery.Log,
 		WKMesh: mesh,
 	})
-	// discovery.AddStaticNode("10.0.0.221", "11110")
+
 	// 添加优雅关闭处理
 	go func() {
 		c := make(chan os.Signal, 1)
