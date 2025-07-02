@@ -22,13 +22,6 @@ import (
 	"k8s.io/client-go/rest"
 )
 
-type NodeStatus string
-
-const (
-	NodeStatusOnline  NodeStatus = "online"  // 在线状态
-	NodeStatusOffline NodeStatus = "offline" // 离线状态
-)
-
 type UDPBody struct {
 	Name      string `json:"name"`      // 节点名称
 	IP        string `json:"ip"`        // 节点IP地址
@@ -58,6 +51,15 @@ type Listener interface {
 	OnNodeUpdate(node NodeInfo)
 	OnNodeDelete(name string)
 }
+
+type NodeStatus string
+
+const (
+	NodeStatusOnline  NodeStatus = "online"  // 在线状态
+	NodeStatusOffline NodeStatus = "offline" // 离线状态
+)
+
+// ... [其他结构体定义保持不变] ...
 
 // Discovery 服务发现核心结构
 type Discovery struct {
@@ -211,14 +213,26 @@ func (d *Discovery) setupMDNS() {
 
 // mDNS服务发现循环（仅IPv4）
 func (d *Discovery) mdnsDiscoveryLoop() {
-	d.Log.Info("启动mDNS发现循环", zap.String("interval", "10s"))
+	// 从环境变量获取查询间隔，默认为30秒
+	interval := 30
+	if val := getEnv("MDNS_QUERY_INTERVAL", ""); val != "" {
+		if i, err := strconv.Atoi(val); err == nil && i > 0 {
+			interval = i
+		}
+	}
+	d.Log.Info("启动mDNS发现循环", zap.Int("interval_seconds", interval))
 
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(time.Duration(interval) * time.Second)
 	defer ticker.Stop()
 
 	for !d.shutdown {
+		// 创建缓冲通道处理mDNS条目
 		entriesCh := make(chan *mdns.ServiceEntry, 16)
+		doneCh := make(chan struct{})
+
+		// 处理条目的协程
 		go func() {
+			defer close(doneCh)
 			for entry := range entriesCh {
 				d.handleMDNSEntry(entry)
 			}
@@ -232,15 +246,41 @@ func (d *Discovery) mdnsDiscoveryLoop() {
 			Entries:   entriesCh,
 			Interface: getIPv4Interface(), // 仅查询IPv4接口
 		}
+
+		// 执行查询
 		err := mdns.Query(params)
 		if err != nil {
 			d.Log.Warn("mDNS查询失败", zap.Error(err))
 		}
 
+		// 关闭通道并等待处理完成
 		close(entriesCh)
-		<-ticker.C
+		<-doneCh
+
+		// 等待下一次查询
+		select {
+		case <-ticker.C:
+			// 继续下一次查询
+		case <-d.shutdownChan():
+			// 收到关闭信号
+			return
+		}
 	}
 	d.Log.Info("mDNS发现循环退出")
+}
+
+// 获取关闭信号通道
+func (d *Discovery) shutdownChan() <-chan struct{} {
+	ch := make(chan struct{})
+	go func() {
+		d.mu.RLock()
+		defer d.mu.RUnlock()
+		for !d.shutdown {
+			time.Sleep(100 * time.Millisecond)
+		}
+		close(ch)
+	}()
+	return ch
 }
 
 // 处理mDNS发现结果
@@ -825,12 +865,4 @@ func HashIPTo1024(ipStr string) (uint32, error) {
 	}
 	// 使用IP地址的最后两个字节生成节点ID
 	return uint32(ip[2])<<8 | uint32(ip[3]), nil
-}
-
-// 获取环境变量，如果不存在则返回默认值
-func getEnv(key, defaultValue string) string {
-	if value, exists := os.LookupEnv(key); exists {
-		return value
-	}
-	return defaultValue
 }
