@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"hash/fnv"
 	"maps"
 	"net"
 	"net/http"
@@ -33,7 +32,7 @@ const (
 type UDPBody struct {
 	Name      string `json:"name"`      // 节点名称
 	IP        string `json:"ip"`        // 节点IP地址
-	Port      int    `json:"port"`      // 节点端口
+	Port      string `json:"port"`      // 节点端口
 	Version   string `json:"version"`   // 节点版本
 	RestPort  string `json:"rest_port"` // REST端口
 	Timestamp int64  `json:"timestamp"` // 时间戳
@@ -63,7 +62,7 @@ type Listener interface {
 // Discovery 服务发现核心结构
 type Discovery struct {
 	SelfName     string
-	SelfPort     int
+	SelfPort     string
 	Version      string
 	Log          *wklog.WKLog
 	nodes        map[string]NodeInfo
@@ -79,15 +78,38 @@ type Discovery struct {
 
 func newDiscovery(selfName, selfPort string) *Discovery {
 	d := &Discovery{
-		Log: wklog.NewWKLog("WKMesh.Discovery"),
-		// SelfName:  selfName,
-		// SelfPort:  selfPort,
+		Log:         wklog.NewWKLog("WKMesh.Discovery"),
+		SelfName:    selfName,
+		SelfPort:    selfPort,
 		Version:     version.Version,
 		nodes:       make(map[string]NodeInfo),
 		listeners:   make([]Listener, 0),
 		isK8sEnv:    os.Getenv("KUBERNETES_SERVICE_HOST") != "",
-		serviceName: "_wukongim._tcp", // 自定义mDNS服务名称
+		serviceName: getEnv("MDNS_SERVICE_NAME", "_wukongim._tcp"),
 	}
+
+	// 初始化自身节点信息
+	selfIP := GetLocalIP()
+	nodeId, _ := HashIPTo1024(selfIP)
+	selfNode := NodeInfo{
+		NodeId:    nodeId,
+		Name:      selfName,
+		IP:        selfIP,
+		Port:      selfPort,
+		Version:   version.Version,
+		LastSeen:  time.Now(),
+		Reachable: true,
+		Latency:   0,
+		Status:    NodeStatusOnline,
+	}
+	d.nodes[d.SelfName] = selfNode
+
+	d.Log.Info("节点初始化完成",
+		zap.String("name", selfName),
+		zap.String("ip", selfIP),
+		zap.String("port", selfPort),
+		zap.Bool("k8s", d.isK8sEnv),
+	)
 
 	// 启动核心协程
 	go d.cleanupLoop()
@@ -110,7 +132,7 @@ func newDiscovery(selfName, selfPort string) *Discovery {
 		// 启动单播循环
 		go d.unicastLoop()
 	} else {
-		// 非 Kubernetes 环境使用多播
+		// 非 Kubernetes 环境使用mDNS
 		go d.setupMDNS()
 	}
 
@@ -129,17 +151,37 @@ func (d *Discovery) setupMDNS() {
 
 	// 获取本地IP
 	ip := GetLocalIP()
-	host, _ := os.Hostname()
+
+	// 转换端口为整数
+	portInt, err := strconv.Atoi(d.SelfPort)
+	if err != nil {
+		d.Log.Error("端口转换失败", zap.Error(err))
+		return
+	}
+
 	// 创建服务信息
-	info := []string{"WuKongIM节点"}
+	restPort := getEnv("REST_PORT", "11110")
+	info := []string{
+		d.SelfName,                               // 节点名称
+		restPort,                                 // REST端口
+		strconv.FormatInt(time.Now().Unix(), 10), // 启动时间戳
+	}
+
+	// 强制使用IPv4地址
+	ipAddr := net.ParseIP(ip)
+	if ipAddr.To4() == nil {
+		d.Log.Warn("非IPv4地址，强制使用IPv4回环地址", zap.String("ip", ip))
+		ipAddr = net.ParseIP("127.0.0.1")
+	}
+
 	service, err := mdns.NewMDNSService(
-		host,
+		d.SelfName,
 		d.serviceName,
-		"",                        // 域名
-		"",                        // 主机名
-		5353,                      // 端口
-		[]net.IP{net.ParseIP(ip)}, // IP地址
-		info,                      // 附加信息
+		"",               // 域名
+		"",               // 主机名
+		portInt,          // 端口
+		[]net.IP{ipAddr}, // IP地址（强制IPv4）
+		info,             // 附加信息
 	)
 	if err != nil {
 		d.Log.Error("创建mDNS服务失败", zap.Error(err))
@@ -149,7 +191,7 @@ func (d *Discovery) setupMDNS() {
 	// 创建mDNS服务器
 	server, err := mdns.NewServer(&mdns.Config{
 		Zone:  service,
-		Iface: nil, // 监听所有接口
+		Iface: getIPv4Interface(), // 仅使用IPv4接口
 	})
 	if err != nil {
 		d.Log.Error("创建mDNS服务器失败", zap.Error(err))
@@ -160,14 +202,14 @@ func (d *Discovery) setupMDNS() {
 	d.Log.Info("mDNS服务已启动",
 		zap.String("name", d.SelfName),
 		zap.String("ip", ip),
-		zap.Int("port", d.SelfPort),
+		zap.Int("port", portInt),
 	)
 
-	// 启动mDNS发现循环
+	// 启动mDNS发现循环（仅IPv4）
 	go d.mdnsDiscoveryLoop()
 }
 
-// mDNS服务发现循环
+// mDNS服务发现循环（仅IPv4）
 func (d *Discovery) mdnsDiscoveryLoop() {
 	d.Log.Info("启动mDNS发现循环", zap.String("interval", "10s"))
 
@@ -182,12 +224,13 @@ func (d *Discovery) mdnsDiscoveryLoop() {
 			}
 		}()
 
-		// 执行mDNS查询
+		// 执行mDNS查询 - 强制使用IPv4
 		params := &mdns.QueryParam{
-			Service: d.serviceName,
-			Domain:  "local",
-			Timeout: 5 * time.Second,
-			Entries: entriesCh,
+			Service:   d.serviceName,
+			Domain:    "local",
+			Timeout:   5 * time.Second,
+			Entries:   entriesCh,
+			Interface: getIPv4Interface(), // 仅查询IPv4接口
 		}
 		err := mdns.Query(params)
 		if err != nil {
@@ -203,18 +246,19 @@ func (d *Discovery) mdnsDiscoveryLoop() {
 // 处理mDNS发现结果
 func (d *Discovery) handleMDNSEntry(entry *mdns.ServiceEntry) {
 	// 忽略自身节点
-	if entry.Name == d.SelfName+"._wukongim._tcp.local." {
+	if entry.Name == d.SelfName+"."+d.serviceName+".local." {
 		return
 	}
 
-	// 提取IP地址
+	// 提取IP地址 - 优先IPv4
 	ip := ""
 	if len(entry.AddrV4) > 0 {
 		ip = entry.AddrV4.String()
-	} else if len(entry.AddrV6) > 0 {
-		ip = entry.AddrV6.String()
-	} else if entry.Addr != nil {
+	} else if entry.Addr != nil && entry.Addr.To4() != nil {
 		ip = entry.Addr.String()
+	} else if len(entry.AddrV6) > 0 {
+		// 如果没有IPv4地址，则使用IPv6
+		ip = entry.AddrV6.String()
 	}
 
 	if ip == "" {
@@ -222,20 +266,28 @@ func (d *Discovery) handleMDNSEntry(entry *mdns.ServiceEntry) {
 		return
 	}
 
-	// 节点名称从服务名称中提取（去掉后缀）
-	name := entry.InfoFields[0] // 第一个info字段存储节点名称
+	// 节点名称从info字段获取
+	name := ""
+	restPort := getEnv("REST_PORT", "11110")
+	if len(entry.InfoFields) > 0 {
+		name = entry.InfoFields[0]
+	}
 	if name == "" {
+		// 如果info字段没有，则从服务名解析
 		name = entry.Name
-		if len(name) > len(d.serviceName)+7 {
-			name = name[:len(name)-(len(d.serviceName)+7)]
+		// 去除服务后缀
+		suffix := "." + d.serviceName + ".local."
+		if len(name) > len(suffix) && name[len(name)-len(suffix):] == suffix {
+			name = name[:len(name)-len(suffix)]
 		}
 	}
 
-	// 测试节点可达性
-	restPort := "11110" // 默认REST端口
+	// 获取REST端口
 	if len(entry.InfoFields) > 1 {
-		restPort = entry.InfoFields[1] // 第二个info字段存储REST端口
+		restPort = entry.InfoFields[1]
 	}
+
+	// 测试节点可达性
 	reachable, latency := testRESTPing(ip, restPort)
 
 	nodeId, _ := HashIPTo1024(ip)
@@ -251,27 +303,44 @@ func (d *Discovery) handleMDNSEntry(entry *mdns.ServiceEntry) {
 		Status:    NodeStatusOnline,
 	}
 
-	d.mu.Lock()
-	existed := false
-	if existingNode, ok := d.nodes[name]; ok {
-		// 保留现有状态
-		node.Status = existingNode.Status
-		existed = true
-	}
-	d.nodes[name] = node
-	d.mu.Unlock()
+	d.addOrUpdateNode(node)
+}
 
-	if !existed {
-		d.Log.Info("通过mDNS发现新节点",
-			zap.String("name", node.Name),
-			zap.String("ip", node.IP),
-			zap.String("port", node.Port),
-			zap.Duration("latency", node.Latency),
-		)
-		for _, l := range d.listeners {
-			go l.OnNodeUpdate(node)
+// 获取IPv4网络接口
+func getIPv4Interface() *net.Interface {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+
+	for _, iface := range ifaces {
+		// 跳过回环和未启用的接口
+		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+
+			// 检查是否为IPv4地址
+			if ip.To4() != nil {
+				return &iface
+			}
 		}
 	}
+
+	return nil
 }
 
 // 初始化 Kubernetes 客户端
@@ -300,23 +369,13 @@ func (d *Discovery) discoverK8sPods() {
 	}
 
 	// 获取命名空间
-	namespace := os.Getenv("POD_NAMESPACE")
+	namespace := getEnv("POD_NAMESPACE", "default")
 	if namespace == "" {
-		// 尝试从 service account 获取
-		if data, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace"); err == nil {
-			namespace = string(data)
-		} else {
-			namespace = "default"
-			d.Log.Warn("无法获取命名空间，使用默认值", zap.String("namespace", namespace))
-		}
+		namespace = "default"
 	}
 
 	// 获取标签选择器
-	selector := os.Getenv("MESH_POD_SELECTOR")
-	if selector == "" {
-		selector = "app=wukong-im"
-		d.Log.Info("使用默认标签选择器", zap.String("selector", selector))
-	}
+	selector := getEnv("MESH_POD_SELECTOR", "app=wukong-im")
 
 	d.Log.Debug("发现Kubernetes Pod",
 		zap.String("namespace", namespace),
@@ -338,8 +397,7 @@ func (d *Discovery) discoverK8sPods() {
 	for _, pod := range pods.Items {
 		// 跳过自身
 		if pod.Status.PodIP == GetLocalIP() {
-			d.Log.Info("发现自身Pod")
-			// continue
+			continue
 		}
 
 		// 跳过非运行状态的 Pod
@@ -352,10 +410,7 @@ func (d *Discovery) discoverK8sPods() {
 		}
 
 		// 获取端口
-		port := os.Getenv("MESH_PORT")
-		if port == "" {
-			port = "11110"
-		}
+		port := getEnv("MESH_PORT", "11110")
 
 		// 检查容器中是否有自定义端口设置
 		if len(pod.Spec.Containers) > 0 {
@@ -372,7 +427,7 @@ func (d *Discovery) discoverK8sPods() {
 			Name:      pod.Name,
 			IP:        pod.Status.PodIP,
 			Port:      port,
-			Version:   "",
+			Version:   version.Version,
 			LastSeen:  time.Now(),
 			Reachable: true, // 假设可达，后续会检查
 		})
@@ -385,16 +440,22 @@ func (d *Discovery) addOrUpdateNode(node NodeInfo) {
 	defer d.mu.Unlock()
 
 	// 如果节点不存在或信息有变化，则更新
-	if existing, ok := d.nodes[node.Name]; !ok ||
-		existing.IP != node.IP ||
-		existing.Port != node.Port {
-
+	existing, exists := d.nodes[node.Name]
+	if !exists || existing.IP != node.IP || existing.Port != node.Port || existing.Status != node.Status {
+		if exists {
+			d.Log.Debug("更新节点信息",
+				zap.String("name", node.Name),
+				zap.Any("old", existing),
+				zap.Any("new", node),
+			)
+		} else {
+			d.Log.Info("发现新节点",
+				zap.String("name", node.Name),
+				zap.String("ip", node.IP),
+				zap.String("port", node.Port),
+			)
+		}
 		d.nodes[node.Name] = node
-		d.Log.Info("添加/更新节点",
-			zap.String("name", node.Name),
-			zap.String("ip", node.IP),
-			zap.String("port", node.Port),
-		)
 
 		// 通知监听器
 		for _, l := range d.listeners {
@@ -439,7 +500,7 @@ func (d *Discovery) unicastLoop() {
 				IP:        GetLocalIP(),
 				Port:      d.SelfPort,
 				Version:   d.Version,
-				RestPort:  "11110",
+				RestPort:  getEnv("REST_PORT", "11110"),
 				Timestamp: time.Now().UnixMilli(),
 			}
 
@@ -453,9 +514,10 @@ func (d *Discovery) unicastLoop() {
 
 		// 更新自身节点最后可见时间
 		d.mu.Lock()
-		node := d.nodes[d.SelfName]
-		node.LastSeen = time.Now()
-		d.nodes[d.SelfName] = node
+		if node, ok := d.nodes[d.SelfName]; ok {
+			node.LastSeen = time.Now()
+			d.nodes[d.SelfName] = node
+		}
 		d.mu.Unlock()
 	}
 }
@@ -482,51 +544,6 @@ func (d *Discovery) sendUDPMessage(ip string, port int, msg *UDPBody) error {
 	return nil
 }
 
-// 多播广播循环
-func (d *Discovery) multicastLoop() {
-	d.Log.Info("启动多播广播循环", zap.String("interval", "5s"))
-
-	multicastAddr := &net.UDPAddr{
-		IP:   net.IPv4allrouter,
-		Port: 11110,
-	}
-
-	conn, err := net.DialUDP("udp", nil, multicastAddr)
-	if err != nil {
-		d.Log.Error("创建多播广播连接失败", zap.Error(err))
-		return
-	}
-	defer conn.Close()
-
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for !d.shutdown {
-		<-ticker.C
-		ip := GetLocalIP()
-		msg := &UDPBody{
-			Name:      d.SelfName,
-			IP:        ip,
-			Port:      d.SelfPort,
-			Version:   d.Version,
-			Announce:  true,
-			Timestamp: time.Now().UnixMilli(),
-		}
-		b, _ := json.Marshal(msg)
-
-		if _, err := conn.Write(b); err != nil {
-			d.Log.Warn("多播广播发送失败", zap.Error(err))
-		}
-
-		// 更新自身节点最后可见时间
-		d.mu.Lock()
-		node := d.nodes[d.SelfName]
-		node.LastSeen = time.Now()
-		d.nodes[d.SelfName] = node
-		d.mu.Unlock()
-	}
-}
-
 // Announce 发送上线通知
 func (d *Discovery) Announce() {
 	if d.hasAnnounced || d.shutdown {
@@ -535,7 +552,6 @@ func (d *Discovery) Announce() {
 
 	d.Log.Info("发送上线通知")
 
-	// Kubernetes 环境使用单播，非 Kubernetes 使用多播
 	if d.isK8sEnv {
 		// 向所有已知节点发送上线通知
 		nodes := d.GetAllNodes()
@@ -577,7 +593,6 @@ func (d *Discovery) Shutdown() {
 
 	d.Log.Info("节点正在关闭，发送下线通知")
 
-	// Kubernetes 环境使用单播，非 Kubernetes 使用多播
 	if d.isK8sEnv {
 		// 向所有已知节点发送下线通知
 		nodes := d.GetAllNodes()
@@ -634,7 +649,7 @@ func (d *Discovery) cleanupLoop() {
 	for !d.shutdown {
 		<-ticker.C
 		now := time.Now()
-		removed := []string{}
+		removed := []NodeInfo{}
 
 		d.mu.Lock()
 		for name, node := range d.nodes {
@@ -642,27 +657,19 @@ func (d *Discovery) cleanupLoop() {
 				continue // 忽略自身
 			}
 
-			// 对于标记为下线的节点，立即清理
-			if node.Status == NodeStatusOffline {
+			if node.Status == NodeStatusOffline || now.Sub(node.LastSeen) > 30*time.Second {
+				removed = append(removed, node)
 				delete(d.nodes, name)
-				removed = append(removed, name)
-				continue
-			}
-
-			// 正常节点超时清理
-			if now.Sub(node.LastSeen) > 30*time.Second {
-				delete(d.nodes, name)
-				removed = append(removed, name)
 			}
 		}
 		d.mu.Unlock()
 
 		// 通知监听器
 		if len(removed) > 0 {
-			d.Log.Info("清理过期节点", zap.Strings("nodes", removed))
-			for _, name := range removed {
+			d.Log.Info("清理过期节点", zap.Int("count", len(removed)))
+			for _, node := range removed {
 				for _, l := range d.listeners {
-					go l.OnNodeDelete(name)
+					go l.OnNodeDelete(node.Name)
 				}
 			}
 		}
@@ -678,7 +685,7 @@ func (d *Discovery) RegisterListener(l Listener) {
 
 // 添加静态节点
 func (d *Discovery) AddStaticNode(ip, port string) {
-	reachable, latency := testRESTPing(ip, "11110")
+	reachable, latency := testRESTPing(ip, getEnv("REST_PORT", "11110"))
 	name := fmt.Sprintf("static-%s:%s", ip, port)
 	nodeId, _ := HashIPTo1024(ip)
 
@@ -694,15 +701,8 @@ func (d *Discovery) AddStaticNode(ip, port string) {
 		Status:    NodeStatusOnline,
 	}
 
-	d.mu.Lock()
-	d.nodes[name] = node
-	d.mu.Unlock()
-
+	d.addOrUpdateNode(node)
 	d.Log.Info("添加静态节点", zap.String("ip", ip), zap.String("port", port))
-
-	for _, l := range d.listeners {
-		go l.OnNodeUpdate(node)
-	}
 }
 
 // 获取所有节点列表
@@ -793,7 +793,9 @@ func GetLocalIP() string {
 
 // 测试节点REST可达性
 func testRESTPing(ip, port string) (bool, time.Duration) {
-	url := fmt.Sprintf("http://%s:%s/health", ip, port)
+	scheme := getEnv("REST_SCHEME", "http")
+	path := getEnv("HEALTH_CHECK_PATH", "/health")
+	url := fmt.Sprintf("%s://%s:%s%s", scheme, ip, port, path)
 	client := &http.Client{Timeout: 2 * time.Second}
 
 	start := time.Now()
@@ -811,12 +813,24 @@ func testRESTPing(ip, port string) (bool, time.Duration) {
 	return true, time.Since(start)
 }
 
-// IP转
+// IP转节点ID (0-1023)
 func HashIPTo1024(ipStr string) (uint32, error) {
-	h := fnv.New32a()
-	_, err := h.Write([]byte(ipStr))
-	if err != nil {
-		return 0, err
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return 0, fmt.Errorf("invalid IP address: %s", ipStr)
 	}
-	return uint32(h.Sum32() % 1024), nil
+	ip = ip.To4()
+	if ip == nil {
+		return 0, fmt.Errorf("only IPv4 supported")
+	}
+	// 使用IP地址的最后两个字节生成节点ID
+	return uint32(ip[2])<<8 | uint32(ip[3]), nil
+}
+
+// 获取环境变量，如果不存在则返回默认值
+func getEnv(key, defaultValue string) string {
+	if value, exists := os.LookupEnv(key); exists {
+		return value
+	}
+	return defaultValue
 }

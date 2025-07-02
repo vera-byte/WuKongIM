@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/server"
-	pb "github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
 
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"go.uber.org/zap"
@@ -42,15 +41,15 @@ func (l *MyListener) OnNodeUpdate(node NodeInfo) {
 		zap.Int("count", len(nodes)),
 		zap.Any("nodes", nodes),
 	)
-	if l.WKMesh.Server != nil {
-		n := &pb.Node{
-			Id:            uint64(node.NodeId),
-			ClusterAddr:   node.IP,
-			ApiServerAddr: node.IP,
-			Online:        node.Status == NodeStatusOnline,
-		}
-		l.WKMesh.Server.GetClusterConfigServer().ProposeJoin(n)
-	}
+	// if l.WKMesh.Server != nil {
+	// 	n := &pb.Node{
+	// 		Id:            uint64(node.NodeId),
+	// 		ClusterAddr:   node.IP,
+	// 		ApiServerAddr: node.IP,
+	// 		Online:        node.Status == NodeStatusOnline,
+	// 	}
+	// 	l.WKMesh.Server.GetClusterConfigServer().ProposeJoin(n)
+	// }
 
 }
 
