@@ -33,7 +33,7 @@ const (
 type UDPBody struct {
 	Name      string `json:"name"`      // 节点名称
 	IP        string `json:"ip"`        // 节点IP地址
-	Port      string `json:"port"`      // 节点端口
+	Port      int    `json:"port"`      // 节点端口
 	Version   string `json:"version"`   // 节点版本
 	RestPort  string `json:"rest_port"` // REST端口
 	Timestamp int64  `json:"timestamp"` // 时间戳
@@ -63,7 +63,7 @@ type Listener interface {
 // Discovery 服务发现核心结构
 type Discovery struct {
 	SelfName     string
-	SelfPort     string
+	SelfPort     int
 	Version      string
 	Log          *wklog.WKLog
 	nodes        map[string]NodeInfo
@@ -129,22 +129,15 @@ func (d *Discovery) setupMDNS() {
 
 	// 获取本地IP
 	ip := GetLocalIP()
-
-	// 转换端口为整数
-	portInt, err := strconv.Atoi(d.SelfPort)
-	if err != nil {
-		d.Log.Error("端口转换失败", zap.Error(err))
-		return
-	}
-
+	host, _ := os.Hostname()
 	// 创建服务信息
 	info := []string{"WuKongIM节点"}
 	service, err := mdns.NewMDNSService(
-		d.SelfName,
+		host,
 		d.serviceName,
 		"",                        // 域名
 		"",                        // 主机名
-		portInt,                   // 端口
+		5353,                      // 端口
 		[]net.IP{net.ParseIP(ip)}, // IP地址
 		info,                      // 附加信息
 	)
@@ -167,7 +160,7 @@ func (d *Discovery) setupMDNS() {
 	d.Log.Info("mDNS服务已启动",
 		zap.String("name", d.SelfName),
 		zap.String("ip", ip),
-		zap.Int("port", portInt),
+		zap.Int("port", d.SelfPort),
 	)
 
 	// 启动mDNS发现循环
