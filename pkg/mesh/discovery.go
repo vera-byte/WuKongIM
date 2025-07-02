@@ -1,14 +1,12 @@
 package wkmesh
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"maps"
 	"net"
 	"net/http"
 	"os"
-	"strconv"
 	"sync"
 	"time"
 
@@ -16,10 +14,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/version"
 	"github.com/hashicorp/mdns"
 	"go.uber.org/zap"
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 )
 
 type UDPBody struct {
@@ -32,6 +27,13 @@ type UDPBody struct {
 	Announce  bool   `json:"announce"`  // 是否为上线通知
 	Shutdown  bool   `json:"shutdown"`  // 是否为下线通知
 }
+
+type NodeStatus string
+
+const (
+	NodeStatusOnline  NodeStatus = "online"  // 在线状态
+	NodeStatusOffline NodeStatus = "offline" // 离线状态
+)
 
 // NodeInfo 节点信息结构
 type NodeInfo struct {
@@ -51,15 +53,6 @@ type Listener interface {
 	OnNodeUpdate(node NodeInfo)
 	OnNodeDelete(name string)
 }
-
-type NodeStatus string
-
-const (
-	NodeStatusOnline  NodeStatus = "online"  // 在线状态
-	NodeStatusOffline NodeStatus = "offline" // 离线状态
-)
-
-// ... [其他结构体定义保持不变] ...
 
 // Discovery 服务发现核心结构
 type Discovery struct {
@@ -118,21 +111,7 @@ func newDiscovery(selfName, selfPort string) *Discovery {
 
 	// Kubernetes 环境特殊处理
 	if d.isK8sEnv {
-		d.Log.Info("运行在Kubernetes环境中")
-
-		// 初始化 Kubernetes 客户端
-		if err := d.initK8sClient(); err != nil {
-			d.Log.Error("Kubernetes客户端初始化失败", zap.Error(err))
-		} else {
-			// 启动 Kubernetes 发现循环
-			go d.k8sDiscoveryLoop()
-
-			// 立即执行一次发现
-			go d.discoverK8sPods()
-		}
-
-		// 启动单播循环
-		go d.unicastLoop()
+		d.initK8s()
 	} else {
 		// 非 Kubernetes 环境使用mDNS
 		go d.setupMDNS()
@@ -145,333 +124,6 @@ func newDiscovery(selfName, selfPort string) *Discovery {
 	}()
 
 	return d
-}
-
-// 设置mDNS服务
-func (d *Discovery) setupMDNS() {
-	d.Log.Info("设置mDNS服务发现")
-
-	// 获取本地IP
-	ip := GetLocalIP()
-
-	// 转换端口为整数
-	portInt, err := strconv.Atoi(d.SelfPort)
-	if err != nil {
-		d.Log.Error("端口转换失败", zap.Error(err))
-		return
-	}
-
-	// 创建服务信息
-	restPort := getEnv("REST_PORT", "11110")
-	info := []string{
-		d.SelfName,                               // 节点名称
-		restPort,                                 // REST端口
-		strconv.FormatInt(time.Now().Unix(), 10), // 启动时间戳
-	}
-
-	// 强制使用IPv4地址
-	ipAddr := net.ParseIP(ip)
-	if ipAddr.To4() == nil {
-		d.Log.Warn("非IPv4地址，强制使用IPv4回环地址", zap.String("ip", ip))
-		ipAddr = net.ParseIP("127.0.0.1")
-	}
-
-	service, err := mdns.NewMDNSService(
-		d.SelfName,
-		d.serviceName,
-		"",               // 域名
-		"",               // 主机名
-		portInt,          // 端口
-		[]net.IP{ipAddr}, // IP地址（强制IPv4）
-		info,             // 附加信息
-	)
-	if err != nil {
-		d.Log.Error("创建mDNS服务失败", zap.Error(err))
-		return
-	}
-
-	// 创建mDNS服务器
-	server, err := mdns.NewServer(&mdns.Config{
-		Zone:  service,
-		Iface: getIPv4Interface(), // 仅使用IPv4接口
-	})
-	if err != nil {
-		d.Log.Error("创建mDNS服务器失败", zap.Error(err))
-		return
-	}
-
-	d.mdnsServer = server
-	d.Log.Info("mDNS服务已启动",
-		zap.String("name", d.SelfName),
-		zap.String("ip", ip),
-		zap.Int("port", portInt),
-	)
-
-	// 启动mDNS发现循环（仅IPv4）
-	go d.mdnsDiscoveryLoop()
-}
-
-// mDNS服务发现循环（仅IPv4）
-func (d *Discovery) mdnsDiscoveryLoop() {
-	// 从环境变量获取查询间隔，默认为30秒
-	interval := 30
-	if val := getEnv("MDNS_QUERY_INTERVAL", ""); val != "" {
-		if i, err := strconv.Atoi(val); err == nil && i > 0 {
-			interval = i
-		}
-	}
-	d.Log.Info("启动mDNS发现循环", zap.Int("interval_seconds", interval))
-
-	ticker := time.NewTicker(time.Duration(interval) * time.Second)
-	defer ticker.Stop()
-
-	for !d.shutdown {
-		// 创建缓冲通道处理mDNS条目
-		entriesCh := make(chan *mdns.ServiceEntry, 16)
-		doneCh := make(chan struct{})
-
-		// 处理条目的协程
-		go func() {
-			defer close(doneCh)
-			for entry := range entriesCh {
-				d.handleMDNSEntry(entry)
-			}
-		}()
-
-		// 执行mDNS查询 - 强制使用IPv4
-		params := &mdns.QueryParam{
-			Service:   d.serviceName,
-			Domain:    "local",
-			Timeout:   5 * time.Second,
-			Entries:   entriesCh,
-			Interface: getIPv4Interface(), // 仅查询IPv4接口
-		}
-
-		// 执行查询
-		err := mdns.Query(params)
-		if err != nil {
-			d.Log.Warn("mDNS查询失败", zap.Error(err))
-		}
-
-		// 关闭通道并等待处理完成
-		close(entriesCh)
-		<-doneCh
-
-		// 等待下一次查询
-		select {
-		case <-ticker.C:
-			// 继续下一次查询
-		case <-d.shutdownChan():
-			// 收到关闭信号
-			return
-		}
-	}
-	d.Log.Info("mDNS发现循环退出")
-}
-
-// 获取关闭信号通道
-func (d *Discovery) shutdownChan() <-chan struct{} {
-	ch := make(chan struct{})
-	go func() {
-		d.mu.RLock()
-		defer d.mu.RUnlock()
-		for !d.shutdown {
-			time.Sleep(100 * time.Millisecond)
-		}
-		close(ch)
-	}()
-	return ch
-}
-
-// 处理mDNS发现结果
-func (d *Discovery) handleMDNSEntry(entry *mdns.ServiceEntry) {
-	// 忽略自身节点
-	if entry.Name == d.SelfName+"."+d.serviceName+".local." {
-		return
-	}
-
-	// 提取IP地址 - 优先IPv4
-	ip := ""
-	if len(entry.AddrV4) > 0 {
-		ip = entry.AddrV4.String()
-	} else if entry.Addr != nil && entry.Addr.To4() != nil {
-		ip = entry.Addr.String()
-	} else if len(entry.AddrV6) > 0 {
-		// 如果没有IPv4地址，则使用IPv6
-		ip = entry.AddrV6.String()
-	}
-
-	if ip == "" {
-		d.Log.Warn("mDNS条目缺少IP地址", zap.String("name", entry.Name))
-		return
-	}
-
-	// 节点名称从info字段获取
-	name := ""
-	restPort := getEnv("REST_PORT", "11110")
-	if len(entry.InfoFields) > 0 {
-		name = entry.InfoFields[0]
-	}
-	if name == "" {
-		// 如果info字段没有，则从服务名解析
-		name = entry.Name
-		// 去除服务后缀
-		suffix := "." + d.serviceName + ".local."
-		if len(name) > len(suffix) && name[len(name)-len(suffix):] == suffix {
-			name = name[:len(name)-len(suffix)]
-		}
-	}
-
-	// 获取REST端口
-	if len(entry.InfoFields) > 1 {
-		restPort = entry.InfoFields[1]
-	}
-
-	// 测试节点可达性
-	reachable, latency := testRESTPing(ip, restPort)
-
-	nodeId, _ := HashIPTo1024(ip)
-	node := NodeInfo{
-		NodeId:    nodeId,
-		Name:      name,
-		IP:        ip,
-		Port:      strconv.Itoa(entry.Port),
-		Version:   version.Version, // 假设版本一致
-		LastSeen:  time.Now(),
-		Reachable: reachable,
-		Latency:   latency,
-		Status:    NodeStatusOnline,
-	}
-
-	d.addOrUpdateNode(node)
-}
-
-// 获取IPv4网络接口
-func getIPv4Interface() *net.Interface {
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return nil
-	}
-
-	for _, iface := range ifaces {
-		// 跳过回环和未启用的接口
-		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
-			continue
-		}
-
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-
-		for _, addr := range addrs {
-			var ip net.IP
-			switch v := addr.(type) {
-			case *net.IPNet:
-				ip = v.IP
-			case *net.IPAddr:
-				ip = v.IP
-			}
-
-			// 检查是否为IPv4地址
-			if ip.To4() != nil {
-				return &iface
-			}
-		}
-	}
-
-	return nil
-}
-
-// 初始化 Kubernetes 客户端
-func (d *Discovery) initK8sClient() error {
-	// 创建集群内配置
-	config, err := rest.InClusterConfig()
-	if err != nil {
-		return fmt.Errorf("创建集群内配置失败: %w", err)
-	}
-
-	// 创建客户端
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		return fmt.Errorf("创建Kubernetes客户端失败: %w", err)
-	}
-
-	d.k8sClient = clientset
-	d.Log.Info("Kubernetes客户端初始化成功")
-	return nil
-}
-
-// 动态发现 Kubernetes Pod
-func (d *Discovery) discoverK8sPods() {
-	if d.k8sClient == nil {
-		return
-	}
-
-	// 获取命名空间
-	namespace := getEnv("POD_NAMESPACE", "default")
-	if namespace == "" {
-		namespace = "default"
-	}
-
-	// 获取标签选择器
-	selector := getEnv("MESH_POD_SELECTOR", "app=wukong-im")
-
-	d.Log.Debug("发现Kubernetes Pod",
-		zap.String("namespace", namespace),
-		zap.String("selector", selector),
-	)
-
-	// 获取 Pod 列表
-	pods, err := d.k8sClient.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{
-		LabelSelector: selector,
-	})
-	if err != nil {
-		d.Log.Error("获取Pod列表失败", zap.Error(err))
-		return
-	}
-
-	d.Log.Info("发现Kubernetes Pod", zap.Int("count", len(pods.Items)))
-
-	// 处理发现的 Pod
-	for _, pod := range pods.Items {
-		// 跳过自身
-		if pod.Status.PodIP == GetLocalIP() {
-			continue
-		}
-
-		// 跳过非运行状态的 Pod
-		if pod.Status.Phase != corev1.PodRunning {
-			d.Log.Debug("跳过非运行状态Pod",
-				zap.String("name", pod.Name),
-				zap.String("phase", string(pod.Status.Phase)),
-			)
-			continue
-		}
-
-		// 获取端口
-		port := getEnv("MESH_PORT", "11110")
-
-		// 检查容器中是否有自定义端口设置
-		if len(pod.Spec.Containers) > 0 {
-			for _, env := range pod.Spec.Containers[0].Env {
-				if env.Name == "MESH_PORT" {
-					port = env.Value
-					break
-				}
-			}
-		}
-
-		// 添加或更新节点
-		d.addOrUpdateNode(NodeInfo{
-			Name:      pod.Name,
-			IP:        pod.Status.PodIP,
-			Port:      port,
-			Version:   version.Version,
-			LastSeen:  time.Now(),
-			Reachable: true, // 假设可达，后续会检查
-		})
-	}
 }
 
 // 添加或更新节点
@@ -504,16 +156,19 @@ func (d *Discovery) addOrUpdateNode(node NodeInfo) {
 	}
 }
 
-// 定期发现循环
-func (d *Discovery) k8sDiscoveryLoop() {
-	d.Log.Info("启动Kubernetes发现循环", zap.String("interval", "30s"))
+// 删除节点
+func (d *Discovery) deleteNode(name string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
+	if _, exists := d.nodes[name]; exists {
+		delete(d.nodes, name)
+		d.Log.Info("删除节点", zap.String("name", name))
 
-	for !d.shutdown {
-		<-ticker.C
-		d.discoverK8sPods()
+		// 通知监听器
+		for _, l := range d.listeners {
+			go l.OnNodeDelete(name)
+		}
 	}
 }
 
@@ -689,7 +344,7 @@ func (d *Discovery) cleanupLoop() {
 	for !d.shutdown {
 		<-ticker.C
 		now := time.Now()
-		removed := []NodeInfo{}
+		removed := []string{}
 
 		d.mu.Lock()
 		for name, node := range d.nodes {
@@ -698,20 +353,14 @@ func (d *Discovery) cleanupLoop() {
 			}
 
 			if node.Status == NodeStatusOffline || now.Sub(node.LastSeen) > 30*time.Second {
-				removed = append(removed, node)
-				delete(d.nodes, name)
+				removed = append(removed, name)
 			}
 		}
 		d.mu.Unlock()
 
-		// 通知监听器
-		if len(removed) > 0 {
-			d.Log.Info("清理过期节点", zap.Int("count", len(removed)))
-			for _, node := range removed {
-				for _, l := range d.listeners {
-					go l.OnNodeDelete(node.Name)
-				}
-			}
+		// 删除过期节点
+		for _, name := range removed {
+			d.deleteNode(name)
 		}
 	}
 	d.Log.Info("清理循环退出")
@@ -865,4 +514,12 @@ func HashIPTo1024(ipStr string) (uint32, error) {
 	}
 	// 使用IP地址的最后两个字节生成节点ID
 	return uint32(ip[2])<<8 | uint32(ip[3]), nil
+}
+
+// 获取环境变量，如果不存在则返回默认值
+func getEnv(key, defaultValue string) string {
+	if value, exists := os.LookupEnv(key); exists {
+		return value
+	}
+	return defaultValue
 }
