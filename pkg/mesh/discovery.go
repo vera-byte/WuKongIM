@@ -9,17 +9,18 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
+	"github.com/WuKongIM/WuKongIM/pkg/wklog"
+	"github.com/WuKongIM/WuKongIM/version"
+	"github.com/hashicorp/mdns"
+	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-
-	"github.com/WuKongIM/WuKongIM/pkg/wklog"
-	"github.com/WuKongIM/WuKongIM/version"
-	"go.uber.org/zap"
 )
 
 type NodeStatus string
@@ -72,47 +73,21 @@ type Discovery struct {
 	hasAnnounced bool // 是否已发送上线通知
 	isK8sEnv     bool // 是否在 Kubernetes 环境中
 	k8sClient    *kubernetes.Clientset
+	mdnsServer   *mdns.Server // mDNS服务器实例
+	serviceName  string       // mDNS服务名称
 }
 
 func newDiscovery(selfName, selfPort string) *Discovery {
-	// selfIP := GetLocalIP()
-	// nodeId, _ := HashIPTo1024(selfIP)
-
-	// // 创建自身节点信息
-	// selfNode := NodeInfo{
-	// 	NodeId:    nodeId,
-	// 	Name:      selfName,
-	// 	IP:        selfIP,
-	// 	Port:      selfPort,
-	// 	Version:   version.Version,
-	// 	LastSeen:  time.Now(),
-	// 	Reachable: true,
-	// 	Latency:   0,
-	// 	Status:    NodeStatusOnline,
-	// }
-
 	d := &Discovery{
 		Log: wklog.NewWKLog("WKMesh.Discovery"),
 		// SelfName:  selfName,
 		// SelfPort:  selfPort,
-		Version:   version.Version,
-		nodes:     make(map[string]NodeInfo),
-		listeners: make([]Listener, 0),
-		isK8sEnv:  os.Getenv("KUBERNETES_SERVICE_HOST") != "",
+		Version:     version.Version,
+		nodes:       make(map[string]NodeInfo),
+		listeners:   make([]Listener, 0),
+		isK8sEnv:    os.Getenv("KUBERNETES_SERVICE_HOST") != "",
+		serviceName: "_wukongim._tcp", // 自定义mDNS服务名称
 	}
-
-	// // 添加自身节点
-	// d.mu.Lock()
-	// d.nodes[d.SelfName] = selfNode
-	// d.mu.Unlock()
-
-	// d.Log.Info("节点初始化完成",
-	// 	zap.String("name", selfName),
-	// 	zap.String("ip", selfIP),
-	// 	zap.String("port", selfPort),
-	// 	zap.Bool("k8s", d.isK8sEnv),
-	// 	zap.String("test", os.Getenv("KUBERNETES_SERVICE_HOST")),
-	// )
 
 	// 启动核心协程
 	go d.cleanupLoop()
@@ -136,8 +111,7 @@ func newDiscovery(selfName, selfPort string) *Discovery {
 		go d.unicastLoop()
 	} else {
 		// 非 Kubernetes 环境使用多播
-		go d.multicastLoop()
-		go d.listenLoop()
+		go d.setupMDNS()
 	}
 
 	// 延迟发送上线通知
@@ -147,6 +121,164 @@ func newDiscovery(selfName, selfPort string) *Discovery {
 	}()
 
 	return d
+}
+
+// 设置mDNS服务
+func (d *Discovery) setupMDNS() {
+	d.Log.Info("设置mDNS服务发现")
+
+	// 获取本地IP
+	ip := GetLocalIP()
+
+	// 转换端口为整数
+	portInt, err := strconv.Atoi(d.SelfPort)
+	if err != nil {
+		d.Log.Error("端口转换失败", zap.Error(err))
+		return
+	}
+
+	// 创建服务信息
+	info := []string{"WuKongIM节点"}
+	service, err := mdns.NewMDNSService(
+		d.SelfName,
+		d.serviceName,
+		"",                        // 域名
+		"",                        // 主机名
+		portInt,                   // 端口
+		[]net.IP{net.ParseIP(ip)}, // IP地址
+		info,                      // 附加信息
+	)
+	if err != nil {
+		d.Log.Error("创建mDNS服务失败", zap.Error(err))
+		return
+	}
+
+	// 创建mDNS服务器
+	server, err := mdns.NewServer(&mdns.Config{
+		Zone:  service,
+		Iface: nil, // 监听所有接口
+	})
+	if err != nil {
+		d.Log.Error("创建mDNS服务器失败", zap.Error(err))
+		return
+	}
+
+	d.mdnsServer = server
+	d.Log.Info("mDNS服务已启动",
+		zap.String("name", d.SelfName),
+		zap.String("ip", ip),
+		zap.Int("port", portInt),
+	)
+
+	// 启动mDNS发现循环
+	go d.mdnsDiscoveryLoop()
+}
+
+// mDNS服务发现循环
+func (d *Discovery) mdnsDiscoveryLoop() {
+	d.Log.Info("启动mDNS发现循环", zap.String("interval", "10s"))
+
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for !d.shutdown {
+		entriesCh := make(chan *mdns.ServiceEntry, 16)
+		go func() {
+			for entry := range entriesCh {
+				d.handleMDNSEntry(entry)
+			}
+		}()
+
+		// 执行mDNS查询
+		params := &mdns.QueryParam{
+			Service: d.serviceName,
+			Domain:  "local",
+			Timeout: 5 * time.Second,
+			Entries: entriesCh,
+		}
+		err := mdns.Query(params)
+		if err != nil {
+			d.Log.Warn("mDNS查询失败", zap.Error(err))
+		}
+
+		close(entriesCh)
+		<-ticker.C
+	}
+	d.Log.Info("mDNS发现循环退出")
+}
+
+// 处理mDNS发现结果
+func (d *Discovery) handleMDNSEntry(entry *mdns.ServiceEntry) {
+	// 忽略自身节点
+	if entry.Name == d.SelfName+"._wukongim._tcp.local." {
+		return
+	}
+
+	// 提取IP地址
+	ip := ""
+	if len(entry.AddrV4) > 0 {
+		ip = entry.AddrV4.String()
+	} else if len(entry.AddrV6) > 0 {
+		ip = entry.AddrV6.String()
+	} else if entry.Addr != nil {
+		ip = entry.Addr.String()
+	}
+
+	if ip == "" {
+		d.Log.Warn("mDNS条目缺少IP地址", zap.String("name", entry.Name))
+		return
+	}
+
+	// 节点名称从服务名称中提取（去掉后缀）
+	name := entry.InfoFields[0] // 第一个info字段存储节点名称
+	if name == "" {
+		name = entry.Name
+		if len(name) > len(d.serviceName)+7 {
+			name = name[:len(name)-(len(d.serviceName)+7)]
+		}
+	}
+
+	// 测试节点可达性
+	restPort := "11110" // 默认REST端口
+	if len(entry.InfoFields) > 1 {
+		restPort = entry.InfoFields[1] // 第二个info字段存储REST端口
+	}
+	reachable, latency := testRESTPing(ip, restPort)
+
+	nodeId, _ := HashIPTo1024(ip)
+	node := NodeInfo{
+		NodeId:    nodeId,
+		Name:      name,
+		IP:        ip,
+		Port:      strconv.Itoa(entry.Port),
+		Version:   version.Version, // 假设版本一致
+		LastSeen:  time.Now(),
+		Reachable: reachable,
+		Latency:   latency,
+		Status:    NodeStatusOnline,
+	}
+
+	d.mu.Lock()
+	existed := false
+	if existingNode, ok := d.nodes[name]; ok {
+		// 保留现有状态
+		node.Status = existingNode.Status
+		existed = true
+	}
+	d.nodes[name] = node
+	d.mu.Unlock()
+
+	if !existed {
+		d.Log.Info("通过mDNS发现新节点",
+			zap.String("name", node.Name),
+			zap.String("ip", node.IP),
+			zap.String("port", node.Port),
+			zap.Duration("latency", node.Latency),
+		)
+		for _, l := range d.listeners {
+			go l.OnNodeUpdate(node)
+		}
+	}
 }
 
 // 初始化 Kubernetes 客户端
@@ -436,35 +568,10 @@ func (d *Discovery) Announce() {
 			}
 		}
 	} else {
-		// 非 Kubernetes 使用多播
-		multicastAddr := &net.UDPAddr{
-			IP:   net.IPv4allrouter,
-			Port: 11110,
-		}
-
-		conn, err := net.DialUDP("udp", nil, multicastAddr)
-		if err != nil {
-			d.Log.Error("创建多播连接失败", zap.Error(err))
-			return
-		}
-		defer conn.Close()
-
-		msg := &UDPBody{
-			Name:      d.SelfName,
-			IP:        GetLocalIP(),
-			Port:      d.SelfPort,
-			Version:   d.Version,
-			Announce:  true,
-			Timestamp: time.Now().UnixMilli(),
-		}
-		b, _ := json.Marshal(msg)
-
-		if _, err := conn.Write(b); err != nil {
-			d.Log.Warn("发送上线通知失败", zap.Error(err))
-		}
+		// 对于mDNS，服务发布已经处理了"上线通知"
+		d.Log.Info("mDNS服务已发布，上线通知已完成")
 	}
 
-	d.Log.Info("上线通知已发送")
 	d.hasAnnounced = true
 }
 
@@ -503,31 +610,10 @@ func (d *Discovery) Shutdown() {
 			}
 		}
 	} else {
-		// 非 Kubernetes 使用多播
-		multicastAddr := &net.UDPAddr{
-			IP:   net.IPv4(224, 0, 0, 250),
-			Port: 11110,
-		}
-
-		conn, err := net.DialUDP("udp", nil, multicastAddr)
-		if err != nil {
-			d.Log.Error("创建多播连接失败", zap.Error(err))
-			return
-		}
-		defer conn.Close()
-
-		msg := &UDPBody{
-			Name:      d.SelfName,
-			IP:        GetLocalIP(),
-			Port:      d.SelfPort,
-			Version:   d.Version,
-			Shutdown:  true,
-			Timestamp: time.Now().UnixMilli(),
-		}
-		b, _ := json.Marshal(msg)
-
-		if _, err := conn.Write(b); err != nil {
-			d.Log.Warn("发送下线通知失败", zap.Error(err))
+		// 关闭mDNS服务器
+		if d.mdnsServer != nil {
+			d.mdnsServer.Shutdown()
+			d.Log.Info("mDNS服务已关闭")
 		}
 	}
 
@@ -543,146 +629,6 @@ func (d *Discovery) Shutdown() {
 
 	// 等待一小段时间确保消息发送
 	time.Sleep(500 * time.Millisecond)
-}
-
-// 监听循环 - 接收网络中的节点信息
-func (d *Discovery) listenLoop() {
-	if d.isK8sEnv {
-		return
-	}
-
-	addr := &net.UDPAddr{
-		IP:   net.IPv4(224, 0, 0, 250),
-		Port: 11110,
-	}
-
-	// 尝试绑定所有网卡
-	conn, err := net.ListenMulticastUDP("udp", nil, addr)
-	if err != nil {
-		d.Log.Error("创建多播监听失败", zap.Error(err))
-		return
-	}
-	conn.SetReadBuffer(2048)
-
-	defer conn.Close()
-
-	d.Log.Info("开始监听节点广播",
-		zap.String("address", addr.String()),
-	)
-
-	buf := make([]byte, 2048)
-	for !d.shutdown {
-		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		n, src, err := conn.ReadFromUDP(buf)
-		if err != nil {
-			if d.shutdown {
-				break
-			}
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue
-			}
-			d.Log.Warn("读取UDP消息失败", zap.Error(err))
-			continue
-		}
-
-		go d.handleMessage(buf[:n], src)
-	}
-
-	d.Log.Info("监听循环退出")
-}
-
-// 处理接收到的节点消息
-func (d *Discovery) handleMessage(data []byte, _ *net.UDPAddr) {
-	var msg UDPBody
-	if err := json.Unmarshal(data, &msg); err != nil {
-		d.Log.Warn("消息解析失败", zap.Error(err))
-		return
-	}
-	if msg.Version != version.Version {
-		d.Log.Warn("收到不同版本的节点消息,版本不一致不能加入统一节点",
-			zap.String("received_version", msg.Version),
-			zap.String("expected_version", version.Version),
-		)
-		return
-	}
-	// 忽略自身消息
-	if msg.Name == d.SelfName {
-		return
-	}
-
-	// 检查是否为上线通知
-	if msg.Announce {
-		d.Log.Info("收到上线通知", zap.String("name", msg.Name))
-
-		// 如果这是新节点，立即回复
-		d.mu.RLock()
-		_, exists := d.nodes[msg.Name]
-		d.mu.RUnlock()
-
-		if !exists {
-			d.Log.Info("回复上线通知", zap.String("name", msg.Name))
-			go d.Announce()
-		}
-	}
-
-	// 检查是否为下线通知
-	if msg.Shutdown {
-		d.Log.Info("收到下线通知", zap.String("name", msg.Name))
-
-		d.mu.Lock()
-		if node, exists := d.nodes[msg.Name]; exists {
-			node.Status = NodeStatusOffline                   // 标记为下线状态
-			node.LastSeen = time.Now().Add(-30 * time.Second) // 立即触发清理
-			d.nodes[msg.Name] = node
-		}
-		d.mu.Unlock()
-
-		// 立即触发节点删除通知
-		for _, l := range d.listeners {
-			go l.OnNodeDelete(msg.Name)
-		}
-		return
-	}
-
-	// 检测节点可达性
-	reachable, latency := testRESTPing(msg.IP, msg.RestPort)
-	nodeId, _ := HashIPTo1024(msg.IP)
-
-	node := NodeInfo{
-		NodeId:    nodeId,
-		Name:      msg.Name,
-		IP:        msg.IP,
-		Port:      msg.Port,
-		Version:   msg.Version,
-		LastSeen:  time.Now(),
-		Reachable: reachable,
-		Latency:   latency,
-		Status:    NodeStatusOnline, // 默认为在线状态
-	}
-
-	d.mu.Lock()
-	existed := false
-	if existingNode, ok := d.nodes[msg.Name]; ok {
-		// 保留现有状态（如果存在）
-		node.Status = existingNode.Status
-		existed = true
-	}
-	d.nodes[msg.Name] = node
-	d.mu.Unlock()
-
-	if !existed {
-		d.Log.Info("发现新节点",
-			zap.String("name", node.Name),
-			zap.String("ip", node.IP),
-			zap.Duration("latency", node.Latency),
-			zap.Bool("reachable", node.Reachable),
-		)
-		for _, l := range d.listeners {
-			go l.OnNodeUpdate(node)
-		}
-	} else {
-		d.Log.Debug("更新节点信息", zap.String("name", msg.Name))
-	}
 }
 
 // 清理过期节点
