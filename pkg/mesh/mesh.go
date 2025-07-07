@@ -1,124 +1,80 @@
 package wkmesh
 
 import (
-	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/WuKongIM/WuKongIM/internal/server"
-
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
+	"github.com/WuKongIM/WuKongIM/version"
+	"github.com/vera-byte/vera-mesh/discovery"
 	"go.uber.org/zap"
 )
 
 type WKMesh struct {
-	Discovery *Discovery   // 服务发现模块
-	LOG       *wklog.WKLog // 日志记录器
-	Server    *server.Server
+	Log    *wklog.WKLog // 日志记录器
+	Server *server.Server
 }
 
-// MyListener 实现 Listener 接口，处理节点事件
-type MyListener struct {
-	LOG    *wklog.WKLog // 日志记录器
-	WKMesh *WKMesh
-}
+func NewMesh(s *server.Server) *WKMesh {
 
-func (l *MyListener) OnNodeUpdate(node NodeInfo) {
-	eventType := "节点更新"
-	if node.Status == NodeStatusOnline {
-		eventType = "节点上线"
-	} else if node.Status == NodeStatusOffline {
-		eventType = "节点下线"
-	}
-
-	l.LOG.Info(eventType,
-		zap.String("name", node.Name),
-		zap.Uint32("nodeId", node.NodeId),
-		zap.String("ip", node.IP),
-		zap.String("port", node.Port),
-		zap.String("version", node.Version),
-		zap.Duration("latency", node.Latency),
-		zap.String("status", string(node.Status)),
-	)
-
-	if l.WKMesh.Server != nil {
-		// n := &pb.Node{
-		// 	Id:            uint64(node.NodeId),
-		// 	ClusterAddr:   fmt.Sprintf("%s:%s", node.IP, node.Port),
-		// 	ApiServerAddr: fmt.Sprintf("%s:%s", node.IP, getEnv("REST_PORT", "11110")),
-		// 	Online:        node.Status == NodeStatusOnline,
-		// }
-
-		// if node.Status == NodeStatusOnline {
-		// 	l.WKMesh.Server.GetClusterConfigServer().ProposeJoin(n)
-		// } else {
-		// 	l.WKMesh.Server.GetClusterConfigServer().ProposeLeave(n)
-		// }
-	}
-
-	// 输出所有节点
-	nodes := l.WKMesh.Discovery.ListNodes()
-	l.LOG.Info("当前所有节点",
-		zap.Int("count", len(nodes)),
-	)
-}
-
-func (l *MyListener) OnNodeDelete(name string) {
-	l.LOG.Info("节点已删除", zap.String("name", name))
-	// 输出所有节点
-	nodes := l.WKMesh.Discovery.ListNodes()
-	l.LOG.Info("当前剩余节点",
-		zap.Int("count", len(nodes)),
-	)
-}
-
-func (m *WKMesh) WithSetServer(server *server.Server) {
-	m.Server = server
-	opts := server.GetClusterConfigServer().Options()
-	m.LOG.Info("正在添加静态节点", zap.Any("nodes", opts.InitNodes))
-	for _, n := range opts.InitNodes {
-		m.Discovery.AddStaticNode(n, "11110")
-	}
-}
-
-// NewMesh 创建并初始化WKMesh实例
-func NewMesh() *WKMesh {
-	log := wklog.NewWKLog("WKMesh")
-	log.Info("Starting WuKongIM Mesh")
-
-	// 获取本地IP和生成节点名
-	localIP := GetLocalIP()
-	name := fmt.Sprintf("node-%s", localIP)
-
-	// 创建发现模块
-	discovery := newDiscovery(name, "11110")
-	if discovery == nil {
-		log.Error("发现模块创建失败")
-		return nil
-	}
-	log.Info("发现模块创建成功", zap.String("node", name))
-
+	log := wklog.NewWKLog("wkmesh")
 	mesh := &WKMesh{
-		Discovery: discovery,
-		LOG:       log,
+		Log:    log,
+		Server: s,
 	}
-	mesh.Discovery.RegisterListener(&MyListener{
-		LOG:    mesh.Discovery.Log,
-		WKMesh: mesh,
+	// 创建配置
+	config := discovery.NewConfig()
+	config.ServiceName = "_myapp._tcp"
+	config.ServicePort = 8080
+	config.Version = version.Version
+
+	// 创建发现管理器
+	manager, err := discovery.NewDiscoveryManager(*config)
+	if err != nil {
+		log.Fatal("创建发现管理器失败:", zap.Error(err))
+	}
+	// 注册事件处理
+	manager.RegisterEventHandler(func(node *discovery.Node, status discovery.NodeStatus) {
+		log.Info("节点状态变更 ", zap.String("实列：", node.Instance), zap.String("状态：", node.StatusString()))
+		if s != nil {
+			switch status {
+			case discovery.StatusOnline:
+				// 节点上线 加入集群
+				if !node.IsLocal {
+					NodeId, _ := HashIPTo1024(node.IP.String())
+					log.Info("节点ID", zap.Uint32("ID", NodeId), zap.String("IP", node.IP.String()))
+					s.GetClusterConfigServer().ProposeJoin(&types.Node{
+						Id: uint64(NodeId),
+						// ClusterAddr:   fmt.Sprintf("%s:%d", node.IP.String(), 11110),
+						// ApiServerAddr: fmt.Sprintf("%s:%d", node.IP.String(), 5001),
+						Join:        true,
+						Online:      true,
+						AllowVote:   true,
+						Status:      types.NodeStatus_NodeStatusWillJoin,
+						CreatedAt:   node.LastSeen.Unix(),
+						LastOffline: node.LastSeen.Unix(),
+						Role:        types.NodeRole_NodeRoleReplica,
+					})
+				} else {
+					log.Info("本地节点上线，跳过集群加入", zap.String("IP", node.IP.String()))
+				}
+
+			}
+		}
 	})
+	// 启动服务
+	if err := manager.Start(); err != nil {
+		log.Fatal("启动服务失败:", zap.Error(err))
+	}
+	defer manager.Stop()
 
-	// 添加优雅关闭处理
-	go func() {
-		c := make(chan os.Signal, 1)
-		signal.Notify(c, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
-		<-c
-		mesh.LOG.Info("接收到关闭信号，开始优雅关闭")
-		mesh.Discovery.Shutdown()
-		time.Sleep(2 * time.Second) // 等待服务注销完成
-		os.Exit(0)
-	}()
-
+	// 等待终止信号
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	<-sigCh
+	log.Info("正在关闭...")
 	return mesh
 }

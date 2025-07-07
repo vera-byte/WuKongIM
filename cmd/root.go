@@ -122,7 +122,7 @@ func cmdRun() error {
 		// 等待集群准备好
 		s.MustWaitAllSlotsReady(time.Minute)
 		// 启动网格服务
-		wkmesh.NewMesh().WithSetServer(s)
+		wkmesh.NewMesh(s)
 
 		// 处理 pingback (如果提供了)
 		if pingback != "" {

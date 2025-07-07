@@ -49,3 +49,5 @@ wukongim.pid
 /config/.env
 /config/config
 /debug/*
+go.work
+/release
