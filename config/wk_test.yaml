@@ -11,7 +11,7 @@ rootDir: "./wukongimdata" # 数据存储目录
 #wssAddr: "wss://0.0.0.0:5210"  # websocket wss 监听地址 如果打开则需要进行 wssConfig相关的证书配置
 #whitelistOffOfPerson: true # 是否关闭个人白名单 默认为true表示关闭个人白名单的验证
 external: # 公网配置
-  ip: "" # 节点外网IP，客户端能够访问到的IP地址，如果客户端是内网使用，这里也可以填写内网IP
+  ip: "10.0.0.192" # 节点外网IP，客户端能够访问到的IP地址，如果客户端是内网使用，这里也可以填写内网IP
 #  tcpAddr: "" #  默认自动获取， 节点的TCP地址 对外公开，APP端长连接通讯  格式： ip:port
 #  wsAddr: "" # 默认自动获取， 节点的wsAdd地址 对外公开 WEB端长连接通讯 格式： ws://ip:port  （支持域名配置）
 #  wssAddr: "" # 对外的wssAddr地址，也就是客户端真正连接的地址 格式：wss://ip:port （支持域名配置）
@@ -84,19 +84,19 @@ jwt: # jwt配置
 #   prometheusApiUrl: "http://xx.xx.xx.xx:9090" # prometheus的内网地址,用于获取监控数据
 
 # 集群配置
-cluster:
-  nodeId: 1001 # 节点ID
-  addr: "tcp://0.0.0.0:11110" # 分布式监听地址
-  serverAddr: "0.0.0.0:11110" # 节点之间能访问到的内网通讯地址 例如：xx.xx.xx.xx:11110
-  # apiUrl: "0.0.0.0:5001" # 节点的http地址 内网地址，节点之间需要能访问到 格式： http://ip:port 例如：http://xx.xx.xx.xx:5001
-  slotCount: 64 # 槽位（分区）数量，默认是64个
-  slotReplicaCount: 3 # 槽位（分区）副本数量，默认是3个
-  channelReplicaCount: 3 # 频道副本数量，默认是3个
-# 初始节点列表 格式 nodeId@ip:port，分布式初始化时的节点列表，列表包含本节点自己
-# 例如：
-initNodes:
-  - "1@10.0.0.s192:11110"
-  - "2@10.0.0.200:11110"
+# cluster:
+#   nodeId: 1001 # 节点ID
+#   apiUrl: "http://10.0.0.192:5001" # 当前节点内网的api地址
+#   serverAddr: "10.0.0.192:11110" # 当前节点内网的分布式通讯地址
+#   # apiUrl: "0.0.0.0:5001" # 节点的http地址 内网地址，节点之间需要能访问到 格式： http://ip:port 例如：http://xx.xx.xx.xx:5001
+#   slotCount: 64 # 槽位（分区）数量，默认是64个
+#   slotReplicaCount: 3 # 槽位（分区）副本数量，默认是3个
+#   channelReplicaCount: 3 # 频道副本数量，默认是3个
+#   # 初始节点列表 格式 nodeId@ip:port，分布式初始化时的节点列表，列表包含本节点自己
+#   # 例如：
+#   initNodes:
+#     - "1001@10.0.0.192:11110"
+#     - "1002@10.0.0.200:11110"
 #   - "1003@192.168.1.14:11110"
 # initNodes:
 #   - ""
