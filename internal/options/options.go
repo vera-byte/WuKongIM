@@ -205,6 +205,7 @@ type Options struct {
 	}
 
 	Cluster struct {
+		NameSpace           string        // 集群命名空间，集群名称 例如：wukongim 用与隔离集群 相同命名空间的才会自动加入
 		NodeId              uint64        // 节点ID,节点Id，必须小于或等于1023 （https://github.com/bwmarrin/snowflake 雪花算法的限制）
 		Addr                string        // 节点监听地址 例如：tcp://0.0.0.0:11110
 		ServerAddr          string        // 节点之间能访问到的内网通讯地址 例如 127.0.0.1:11110
@@ -514,6 +515,7 @@ func New(op ...Option) *Options {
 			Addr: "0.0.0.0:5172",
 		},
 		Cluster: struct {
+			NameSpace                   string
 			NodeId                      uint64
 			Addr                        string
 			ServerAddr                  string
@@ -533,6 +535,7 @@ func New(op ...Option) *Options {
 			SlotReactorSubCount         int
 			PongMaxTick                 int
 		}{
+			NameSpace:                   "wukongim",
 			NodeId:                      1001,
 			Addr:                        "tcp://0.0.0.0:11110",
 			ServerAddr:                  "",

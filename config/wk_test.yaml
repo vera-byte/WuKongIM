@@ -85,9 +85,9 @@ jwt: # jwt配置
 
 # 集群配置
 # cluster:
-#   nodeId: 1001 # 节点ID
-#   apiUrl: "http://10.0.0.192:5001" # 当前节点内网的api地址
-#   serverAddr: "10.0.0.192:11110" # 当前节点内网的分布式通讯地址
+# nodeId: 1001 #s 节点ID
+# apiUrl: "http://10.0.0.192:5001" # 当前节点内网的api地址
+# serverAddr: "10.0.0.192:11110" # 当前节点内网的分布式通讯地址
 #   # apiUrl: "0.0.0.0:5001" # 节点的http地址 内网地址，节点之间需要能访问到 格式： http://ip:port 例如：http://xx.xx.xx.xx:5001
 #   slotCount: 64 # 槽位（分区）数量，默认是64个
 #   slotReplicaCount: 3 # 槽位（分区）副本数量，默认是3个

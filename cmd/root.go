@@ -100,15 +100,30 @@ func cmdRun() error {
 	if !initialed {
 		return nil
 	}
+
 	logOpts := wklog.NewOptions()
+	// 配置自身节点信息
+	ipList, err := wkutil.GetIntranetIP()
+	if err == nil && len(ipList) > 0 {
+		NodeId, _ := wkmesh.GetLastIPSegment(ipList[0]) // 确保 IP 格式正确
+		serverOpts.Cluster.Addr = fmt.Sprintf("tcp://%s:%d", ipList[0], 11110)
+		serverOpts.Cluster.APIUrl = fmt.Sprintf("http://%s:%d", ipList[0], 5001)
+		serverOpts.Cluster.NodeId = uint64(NodeId)
+		serverOpts.HTTPAddr = fmt.Sprintf("%s:%d", ipList[0], 5001)
+		serverOpts.Cluster.ServerAddr = fmt.Sprintf("%s:%d", ipList[0], 11110)
+		// os.Setenv("WK_CLUSTER_NODEID", strconv.FormatUint(serverOpts.Cluster.NodeId, 10))
+		// os.Setenv("WK_CLUSTER_SERVERADDR", serverOpts.Cluster.Addr)
+		// os.Setenv("WK_CLUSTER_APIURL", serverOpts.Cluster.APIUrl)
+		// logOpts.NodeId = uint64(id)
+	}
+	logOpts.NodeId = serverOpts.Cluster.NodeId
 	logOpts.Level = serverOpts.Logger.Level
 	logOpts.LogDir = serverOpts.Logger.Dir
 	logOpts.LineNum = serverOpts.Logger.LineNum
-	logOpts.NodeId = serverOpts.Cluster.NodeId
 	logOpts.TraceOn = serverOpts.Logger.TraceOn
 	logOpts.NoStdout = noStdout
 	wklog.Configure(logOpts)
-
+	wklog.Info("NodeId is ", zap.Uint64("NodeId", logOpts.NodeId))
 	if daemon { // 后台运行
 		// 以子进程方式启动
 		fmt.Println("start as child process")
@@ -123,7 +138,7 @@ func cmdRun() error {
 		// 等待集群准备好
 		s.MustWaitAllSlotsReady(time.Minute)
 		// 启动网格服务
-		wkmesh.NewMesh(s)
+		wkmesh.NewMesh(s, serverOpts.Cluster.NameSpace)
 
 		// 处理 pingback (如果提供了)
 		if pingback != "" {

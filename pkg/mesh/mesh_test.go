@@ -3,14 +3,22 @@ package wkmesh
 import (
 	"fmt"
 	"testing"
+
+	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 )
 
 func TestMesh(t *testing.T) {
 
-	NewMesh(nil)
+	NewMesh(nil, "test")
 }
 
 func TestIp(t *testing.T) {
+	ipList, err := wkutil.GetIntranetIP()
+	if err != nil {
+		t.Fatalf("获取内网IP失败: %v", err)
+	}
+	fmt.Println("内网IP列表:")
+	fmt.Println(ipList)
 	mapper := NewIPMapper()
 
 	// 示例IP列表

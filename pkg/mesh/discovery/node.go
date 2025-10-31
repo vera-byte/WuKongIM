@@ -17,6 +17,7 @@ const (
 
 // Node 表示发现的网络节点
 type Node struct {
+	Id         uint64     // 节点ID
 	Instance   string     // 节点实例名
 	IP         net.IP     // 节点IP地址
 	Port       int        // 节点端口号

@@ -5,10 +5,19 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"sync"
 )
+
+func GetLastIPSegment(ipStr string) (uint16, error) {
+	ip := net.ParseIP(ipStr).To4()
+	if ip == nil {
+		return 0, fmt.Errorf("无效的IPv4地址: %s", ipStr)
+	}
+	return uint16(ip[3]), nil
+}
 
 // IPMapper 管理IP与短数字的双向映射
 type IPMapper struct {

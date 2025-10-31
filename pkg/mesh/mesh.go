@@ -1,6 +1,7 @@
 package wkmesh
 
 import (
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -19,14 +20,15 @@ type WKMesh struct {
 	DiscoveryManager *discovery.DiscoveryManager // 发现管理器
 }
 
-func NewMesh(s *server.Server) *WKMesh {
+func NewMesh(s *server.Server, nanmeSpace string) *WKMesh {
 
 	log := wklog.NewWKLog("wkmesh")
 
 	// 创建配置
 	config := discovery.NewConfig()
-	config.ServiceName = "_myapp._tcp"
+	config.ServiceName = fmt.Sprintf("_%s._tcp", nanmeSpace)
 	config.ServicePort = 8080
+	config.NameSpace = nanmeSpace
 	config.Version = version.Version
 
 	// 创建发现管理器
@@ -44,8 +46,7 @@ func NewMesh(s *server.Server) *WKMesh {
 			return
 		}
 		log.Info("节点状态变更 ", zap.String("实列IP：", node.IP.String()), zap.String("实列：", node.Instance), zap.String("状态：", node.StatusString()))
-		mapper := NewIPMapper()
-		NodeId, err := mapper.IPToShort(node.IP.String())
+		NodeId, err := GetLastIPSegment(node.IP.String())
 		if err != nil {
 			log.Error("IP转换失败", zap.Error(err))
 			return
@@ -58,10 +59,10 @@ func NewMesh(s *server.Server) *WKMesh {
 				if !node.IsLocal {
 					log.Info("节点ID", zap.Uint16("ID", NodeId), zap.String("IP", node.IP.String()))
 					err = s.GetClusterConfigServer().ProposeJoin(&types.Node{
-						Id: uint64(NodeId),
-						// ClusterAddr:   fmt.Sprintf("%s:%d", node.IP.String(), 11110),
-						// ApiServerAddr: fmt.Sprintf("%s:%d", node.IP.String(), 5001),
-						Join:        true,
+						Id:            uint64(NodeId),
+						ClusterAddr:   fmt.Sprintf("%s:%d", node.IP.String(), 11110),
+						ApiServerAddr: fmt.Sprintf("http://%s:%d", node.IP.String(), 5001),
+						// Join:          true,
 						Online:      true,
 						AllowVote:   true,
 						Status:      types.NodeStatus_NodeStatusWillJoin,
@@ -74,7 +75,7 @@ func NewMesh(s *server.Server) *WKMesh {
 					}
 
 				} else {
-					log.Info("本地节点上线，跳过集群加入", zap.String("IP", node.IP.String()))
+					log.Info("自身节点上线，跳过集群加入", zap.String("IP", node.IP.String()))
 				}
 			case discovery.StatusOffline:
 				err = s.GetClusterConfigServer().ProposeNodeOnlineStatus(uint64(NodeId), true)
